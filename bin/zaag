@@ -129,6 +129,28 @@ def pane_id_in(out):
     return int(m.group(1))
 
 
+def appeared(session, wanted, seconds=3.0):
+    """The id of the first terminal pane matching `wanted`, waiting a little for it; else None."""
+    deadline = time.time() + seconds
+    while True:
+        try:
+            found = [p["id"] for p in panes(session) if not p.get("exited") and wanted(p)]
+        except (ZaagError, ValueError):
+            found = []
+        if found or time.time() > deadline:
+            return found[0] if found else None
+        time.sleep(0.15)
+
+
+def quietly(session, *args):
+    """A finishing touch (a name): tried a few times, never worth failing for."""
+    for _ in range(5):
+        try:
+            return zj(session, *args)
+        except ZaagError:
+            time.sleep(0.2)
+
+
 def screen(session, pane, full=False):
     args = ["dump-screen", "-p", f"terminal_{pane}"]
     if full:
@@ -194,7 +216,7 @@ def dialog_options(text):
 def has_dialog(text):
     """A dialog waiting for an answer: numbered choices, or a plain list confirmed with Enter."""
     tail = " ".join("\n".join(text.split("\n")[-12:]).lower().split())  # a narrow pane wraps the hint
-    return bool(dialog_options(text)) or any(hint in tail for hint in ("enter to confirm", "enter to select", "enter continue"))
+    return bool(dialog_options(text)) or any(hint in tail for hint in ("enter to confirm", "enter to select", "enter continue", "enter confirm"))
 
 
 def was_interrupted(text):
@@ -234,15 +256,20 @@ def branch_of(cwd, cache):
 
 
 def settle(session, pane, st):
-    """Hooks miss three things: a dialog that is not a permission request (trusting a folder), a
-    dialog answered (the tool then runs without a word) and an interrupted turn (no Stop). The
-    screen tells."""
+    """Hooks miss four things: the menus an agent shows before its first hook (trust this folder,
+    review these hooks), a dialog that is not a permission request, a dialog answered (the tool
+    then runs without a word) and an interrupted turn (no Stop). The screen tells."""
     age = time.time() - st.get("updated", 0)
+    starting = not st.get("session_id")  # no hook has spoken yet
     try:
         if st["status"] == "blocked" and age > BLOCKED_GRACE:
             text = screen(session, pane)
             if not has_dialog(text):
-                st["status"] = "idle" if was_interrupted(text) else "working"
+                st["status"] = "idle" if starting or was_interrupted(text) else "working"
+                save(session, pane, st)
+        elif st["status"] == "idle" and starting and st.get("agent") in AGENT_COMMANDS:
+            if has_dialog(screen(session, pane)):
+                st["status"] = "blocked"
                 save(session, pane, st)
         elif st["status"] == "working" and age > WORKING_GRACE:
             text = screen(session, pane)
@@ -609,29 +636,37 @@ def cmd_new(args):
         if first is None:
             raise ZaagError("zellij-error", "the new session has no pane")
         if command:
-            zj(session, "new-pane", "--in-place", "--close-replaced-pane", "--pane-id", f"terminal_{first['id']}", "--cwd", cwd, "--name", name, *tail)
-            pane = None
-            for _ in range(50):  # zellij does not say which pane it made in place
-                fresh = [p["id"] for p in panes(session) if p["id"] != first["id"]]
-                if fresh:
-                    pane = fresh[0]
+            # A session this young sometimes answers "There is no active session!" to a call it
+            # then carries out: what counts is whether the agent's pane is there.
+            pane, problem = None, None
+            for _ in range(5):
+                try:
+                    zj(session, "new-pane", "--in-place", "--close-replaced-pane", "--pane-id", f"terminal_{first['id']}", "--cwd", cwd, "--name", name, *tail)
+                except ZaagError as e:
+                    problem = e
+                pane = appeared(session, lambda p: p["id"] != first["id"])  # zellij does not say which pane it made in place
+                if pane is not None:
                     break
-                time.sleep(0.1)
             if pane is None:
-                raise ZaagError("zellij-error", "the agent's pane did not appear")
+                raise problem or ZaagError("zellij-error", "the agent's pane did not appear")
         else:
             pane = first["id"]
-            zj(session, "rename-pane", "-p", f"terminal_{pane}", name)
+            quietly(session, "rename-pane", "-p", f"terminal_{pane}", name)
         if first.get("tab_id") is not None:
-            zj(session, "rename-tab-by-id", str(first["tab_id"]), name)
+            quietly(session, "rename-tab-by-id", str(first["tab_id"]), name)
     elif args.split or not has_clients(session):
         # zellij only builds a new tab once someone is looking at the session
-        opts = ["new-pane", "--cwd", cwd, "--name", name]
-        if args.split:
-            opts += ["--direction", args.split]
-        if not args.focus:
-            opts.append("--no-focus")
-        pane = pane_id_in(zj(session, *opts, *tail))
+        # ...and only places a pane "right" or "down" of the pane someone is on: with nobody
+        # attached it answers with a pane id and makes nothing, so zellij picks the place then.
+        opts = ["new-pane", "--cwd", cwd, "--name", name] + ([] if args.focus else ["--no-focus"])
+        pane = None
+        for placed in ([["--direction", args.split]] if args.split and has_clients(session) else []) + [[]]:
+            made = pane_id_in(zj(session, *opts, *placed, *tail))
+            pane = appeared(session, lambda p: p["id"] == made)
+            if pane is not None:
+                break
+        if pane is None:
+            raise ZaagError("zellij-error", "zellij did not open the pane")
     else:
         before = {p["id"] for p in panes(session)}
         out = zj(session, "new-tab", "--name", name, "--cwd", cwd, *tail)

@@ -129,6 +129,8 @@ The plugin only draws what `zaag list --machines` answers, asked every 2 seconds
 ## Things zellij does
 
 - A session nobody is attached to cannot build a new tab: there `zaag new` opens a pane instead.
+  It cannot place a pane to the right of or below another one either: there `--split` opens the
+  pane wherever zellij finds room.
 - A new session inherits the environment of whoever created it; `zaag new` strips the calling
   agent's own variables first.
 

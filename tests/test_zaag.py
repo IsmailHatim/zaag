@@ -78,6 +78,35 @@ class Screen(unittest.TestCase):
                 zaag.split_id(bad)
 
 
+CODEX_START = """  Hooks need review
+  1 hook is new or changed.
+
+› 1. Review hooks
+  2. Trust all and continue
+  3. Continue without trusting (hooks won't run)
+
+  enter confirm · esc skip
+"""
+
+
+class Settle(unittest.TestCase):
+    def settle(self, st, text):
+        with mock.patch.object(zaag, "screen", return_value=text), mock.patch.object(zaag, "save"):
+            return zaag.settle("proj", 1, dict(st, updated=0))["status"]
+
+    def test_a_start_up_menu_blocks_an_agent_that_has_not_spoken_yet(self):
+        self.assertEqual(self.settle({"agent": "codex", "status": "idle"}, CODEX_START), "blocked")
+
+    def test_and_it_is_idle_again_once_the_menu_is_answered(self):
+        self.assertEqual(self.settle({"agent": "codex", "status": "blocked"}, "› \n"), "idle")
+
+    def test_an_idle_agent_that_has_spoken_is_left_alone(self):
+        self.assertEqual(self.settle({"agent": "codex", "status": "idle", "session_id": "s"}, CODEX_START), "idle")
+
+    def test_a_dialog_answered_mid_turn_means_working(self):
+        self.assertEqual(self.settle({"agent": "claude", "status": "blocked", "session_id": "s"}, "⏺ running\n"), "working")
+
+
 class Hook(unittest.TestCase):
     def setUp(self):
         for f in Path(STATE).glob("agents/*.json"):
