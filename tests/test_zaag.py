@@ -107,6 +107,47 @@ class Settle(unittest.TestCase):
         self.assertEqual(self.settle({"agent": "claude", "status": "blocked", "session_id": "s"}, "⏺ running\n"), "working")
 
 
+class Background(unittest.TestCase):
+    """Claude Code sessions that run in its background service and are only shown in a pane."""
+
+    def setUp(self):
+        for f in Path(STATE).glob("agents/*.json"):
+            f.unlink()
+        self.pane = {"id": 5, "title": "✳ Fix login", "pane_cwd": "/somewhere/else"}
+        self.record = {"Fix login": {"kind": "bg", "name": "Fix login", "sessionId": "real", "cwd": "/w", "status": "busy", "home": STATE}}
+
+    def test_a_pane_titled_like_a_background_session_is_adopted(self):
+        st = zaag.adopt("proj", self.pane, None, self.record)
+        self.assertEqual((st["agent"], st["session_id"], st["status"], st["cwd"]), ("claude", "real", "working", "/w"))
+
+    def test_the_displaying_claude_is_remembered_and_then_ignored(self):
+        zaag.save("proj", 5, {"agent": "claude", "status": "idle", "session_id": "viewer", "done_seq": 0})
+        st = zaag.adopt("proj", self.pane, zaag.load("proj", 5), self.record)
+        self.assertEqual((st["session_id"], st["viewer_session_id"]), ("real", "viewer"))
+
+    def test_other_titles_and_other_agents_are_left_alone(self):
+        self.assertIsNone(zaag.adopt("proj", dict(self.pane, title="zsh"), None, self.record))
+        codex = {"agent": "codex", "status": "idle", "session_id": "c"}
+        self.assertEqual(zaag.adopt("proj", self.pane, codex, self.record), codex)
+
+    def test_its_hooks_find_the_pane_by_the_session_name(self):
+        with mock.patch.object(zaag, "claude_session_name", return_value="Fix login"), \
+             mock.patch.object(zaag, "live_sessions", return_value=["proj"]), \
+             mock.patch.object(zaag, "panes", return_value=[self.pane, {"id": 6, "title": "zsh"}]):
+            self.assertEqual(zaag.claude_pane("real", "/w"), ("proj", "5"))
+            self.assertEqual(zaag.claude_pane(None, "/w"), (None, None))
+
+    def test_a_hook_from_outside_zellij_updates_that_pane(self):
+        stdin = io.StringIO(json.dumps({"hook_event_name": "Stop", "session_id": "real", "cwd": "/w"}))
+        stdin.isatty = lambda: False
+        env = {k: v for k, v in os.environ.items() if not k.startswith("ZELLIJ")}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, "stdin", stdin), \
+             mock.patch.object(zaag, "claude_pane", return_value=("proj", "5")):
+            zaag.main(["hook", "--agent", "claude"])
+        st = zaag.load("proj", 5)
+        self.assertEqual((st["status"], st["session_id"], st["done_seq"]), ("done", "real", 1))
+
+
 class Hook(unittest.TestCase):
     def setUp(self):
         for f in Path(STATE).glob("agents/*.json"):

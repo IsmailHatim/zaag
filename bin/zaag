@@ -284,7 +284,43 @@ def settle(session, pane, st):
     return st
 
 
-def session_rows(session, everything, branches):
+def background_claudes():
+    """Claude Code's background sessions, by name: {name: record} (see claude_pane)."""
+    home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+    found = {}
+    for f in (home / "sessions").glob("*.json"):
+        try:
+            record = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if record.get("kind") == "bg" and record.get("name") and record.get("sessionId"):
+            found[record["name"]] = dict(record, home=str(home))
+    return found
+
+
+def adopt(session, p, st, background):
+    """A pane whose title is a background Claude session's name shows that session: its state
+    is tied to it without waiting for the session's next hook."""
+    record = background.get(clean_title(p.get("title")))
+    if not record or (st or {}).get("session_id") == record["sessionId"]:
+        return st
+    if st and st.get("agent") not in (None, "claude"):
+        return st
+    new = dict(st or {}, agent="claude", session_id=record["sessionId"], cwd=record.get("cwd") or "", bound=time.time())
+    if st and st.get("session_id"):
+        new["viewer_session_id"] = st["session_id"]
+    new["status"] = "working" if record.get("status") == "busy" else "idle"
+    new.setdefault("done_seq", 0)
+    log = Path(record["home"]) / "projects" / re.sub(r"[^A-Za-z0-9]", "-", new["cwd"]) / (record["sessionId"] + ".jsonl")
+    if log.exists():
+        new["transcript_path"] = str(log)
+    else:
+        new.pop("transcript_path", None)
+    save(session, p["id"], new)
+    return new
+
+
+def session_rows(session, everything, branches, background=None):
     rows = []
     listed = panes(session)
     alive = set()
@@ -294,6 +330,8 @@ def session_rows(session, everything, branches):
         pane = p["id"]
         alive.add(pane)
         st = load(session, pane)
+        if background:
+            st = adopt(session, p, st, background)
         if not st and not everything:
             continue
         cwd = (st or {}).get("cwd") or p.get("pane_cwd") or ""
@@ -338,11 +376,12 @@ def local_agents(everything=False, only_session=None):
     if only_session is not None:
         sessions = [s for s in sessions if s == only_session]
     branches = {}
+    background = background_claudes()
     rows = []
 
     def one(s):
         try:
-            return session_rows(s, everything, branches)
+            return session_rows(s, everything, branches, background)
         except (ZaagError, ValueError):
             return []
 
@@ -790,16 +829,70 @@ def hermes_pane(cwd, sid):
     return None, None
 
 
+REBIND_AFTER = 120  # seconds a background session's pane is trusted before it is looked up again
+
+
+def claude_session_name(sid):
+    """What Claude Code calls the session `sid` (the name its pane shows as a title), or None."""
+    home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+    for f in (home / "sessions").glob("*.json"):
+        try:
+            record = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if record.get("sessionId") == sid:
+            return record.get("name")
+    return None
+
+
+def claude_pane(sid, cwd):
+    """Claude Code can run a session in its background service and only show it in a pane: its
+    hooks then run far from zellij. Nothing records which pane shows which session, except the
+    pane's title, which is the session's name. Returns (session, pane) or (None, None)."""
+    if not sid:
+        return None, None
+    for f in AGENTS.glob("*.json") if AGENTS.is_dir() else []:  # already found, not long ago
+        try:
+            st = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if st.get("session_id") == sid and time.time() - st.get("bound", 0) < REBIND_AFTER:
+            session, _, pane = f.stem.rpartition("~")
+            return urllib.parse.unquote(session), pane
+    name = claude_session_name(sid)
+    if not name:
+        return None, None
+
+    def titled(session):
+        try:
+            return [(session, p) for p in panes(session) if not p.get("exited") and clean_title(p.get("title")) == name]
+        except (ZaagError, ValueError):
+            return []
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            found = [hit for hits in pool.map(titled, live_sessions()) for hit in hits]
+    except ZaagError:
+        return None, None
+    if not found:
+        return None, None
+    found.sort(key=lambda hit: hit[1].get("pane_cwd") != cwd)  # the same folder first
+    return found[0][0], str(found[0][1]["id"])
+
+
 def cmd_hook(args):
     """Called by the agent itself on its own events; never fails, never prints."""
     session = os.environ.get("ZELLIJ_SESSION_NAME")
     pane = os.environ.get("ZELLIJ_PANE_ID")
-    if (not session or not pane) and args.agent == "hermes":
+    shown_elsewhere = False  # the agent runs outside the pane that shows it
+    if (not session or not pane) and args.agent in ("hermes", "claude"):
         try:
             peek = json.loads(sys.stdin.read() or "{}")
         except ValueError:
             peek = {}
-        session, pane = hermes_pane(peek.get("cwd"), peek.get("session_id"))
+        find = hermes_pane if args.agent == "hermes" else lambda cwd, sid: claude_pane(sid, cwd)
+        session, pane = find(peek.get("cwd"), peek.get("session_id"))
+        shown_elsewhere = args.agent == "claude"
         sys.stdin = io.StringIO(json.dumps(peek))
     if not session or not (pane or "").isdigit():
         return None
@@ -822,15 +915,21 @@ def cmd_hook(args):
     # Another agent started from inside this one (`claude -p` in its Bash tool) inherits the
     # pane: its events are not this pane's.
     owner = st.get("pid")
-    if owner and sid and st.get("session_id") and sid != st["session_id"] and pid_alive(owner):
+    if shown_elsewhere:
+        if st.get("session_id") and st["session_id"] != sid:
+            st["viewer_session_id"] = st["session_id"]  # the pane's own Claude, which only displays
+        st["bound"] = time.time()
+    elif owner and sid and st.get("session_id") and sid != st["session_id"] and sid != st.get("viewer_session_id") and pid_alive(owner):
         mine = claude_ancestor(os.getppid())
         if mine != owner and (mine is None or is_under(mine, owner)):
             return None
 
     if event == "SessionEnd":
-        if not sid or not st.get("session_id") or sid == st["session_id"]:
+        if not sid or not st.get("session_id") or sid in (st["session_id"], st.get("viewer_session_id")):
             forget(session, pane)
         return None
+    if sid and sid == st.get("viewer_session_id"):
+        return None  # the displaying Claude has nothing to say about the session it shows
 
     status = st.get("status", "idle")
     if event == "SessionStart":
@@ -867,7 +966,7 @@ def cmd_hook(args):
         st["session_id"] = sid
     if data.get("transcript_path"):
         st["transcript_path"] = data["transcript_path"]
-    if data.get("cwd") and (event == "SessionStart" or not st.get("cwd")):
+    if data.get("cwd") and (event == "SessionStart" or shown_elsewhere or not st.get("cwd")):
         st["cwd"] = data["cwd"]
     save(session, pane, st)
     return None
