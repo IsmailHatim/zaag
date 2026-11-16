@@ -1,0 +1,1045 @@
+#!/usr/bin/env python3
+"""zaag: coding agents in zellij.
+
+One zellij session per project, one pane per agent. zaag lists the agents with their status,
+reads their screen, prompts them, sends keys, and creates new ones, on this machine or on
+another one over SSH. Statuses come from the agents' own hooks (`zaag hook`).
+
+Every command prints `{"result": ...}` or `{"error": {"code", "message"}}` on stdout, except
+`read`, which prints the screen as text.
+"""
+import argparse
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+HOME = Path.home()
+STATE = Path(os.environ.get("ZAAG_STATE") or HOME / ".local/state/zaag")
+AGENTS = STATE / "agents"
+CONFIG = Path(os.environ.get("ZAAG_CONFIG") or HOME / ".config/zaag/config.json")
+
+BLOCKED_GRACE = 2.0  # a blocked agent's screen is only second-guessed after this long
+WORKING_GRACE = 4.0  # same for a working one
+OPTION = re.compile(r"^\s*(?:[❯›>]\s*)?(\d)[.)]\s+(.+?)\s*$")
+AGENT_COMMANDS = {"claude": ["claude"], "codex": ["codex"], "hermes": ["hermes"]}
+KEYS = {
+    "esc": "Esc", "escape": "Esc", "enter": "Enter", "return": "Enter", "tab": "Tab",
+    "shift-tab": "Shift Tab", "backspace": "Backspace", "space": "Space",
+    "up": "Up", "down": "Down", "left": "Left", "right": "Right",
+    "ctrl-c": "Ctrl c", "ctrl-d": "Ctrl d", "ctrl-o": "Ctrl o", "ctrl-r": "Ctrl r",
+}
+
+
+class ZaagError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+# ---------------------------------------------------------------- zellij
+
+def zellij_bin():
+    found = shutil.which("zellij")
+    if found:
+        return found
+    for p in (HOME / ".local/bin/zellij", Path("/opt/homebrew/bin/zellij"), HOME / ".cargo/bin/zellij", Path("/usr/local/bin/zellij")):
+        if p.exists():
+            return str(p)
+    raise ZaagError("zellij-missing", "zellij not installed")
+
+
+def run(argv, timeout=8, cwd=None, env=None):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env)
+    except subprocess.TimeoutExpired:
+        raise ZaagError("timeout", f"{os.path.basename(argv[0])} did not answer")
+    except FileNotFoundError:
+        raise ZaagError("not-found", f"{argv[0]} not found")
+
+
+def zj(session, *args, timeout=8):
+    """`zellij --session <session> action <args>`; returns stdout."""
+    p = run([zellij_bin(), "--session", session, "action", *args], timeout=timeout)
+    if p.returncode != 0:
+        raise ZaagError("zellij-error", (p.stderr or p.stdout).strip()[:300] or "zellij failed")
+    return p.stdout
+
+
+def live_sessions():
+    """Names of the running sessions (not the exited ones zellij could resurrect)."""
+    p = run([zellij_bin(), "list-sessions", "-n"])
+    names = []
+    for line in p.stdout.splitlines():
+        m = re.match(r"^(.*?) \[Created ", line)
+        if m and "(EXITED" not in line:
+            names.append(m.group(1))
+    return names
+
+
+ORDER = STATE / "order.json"
+
+
+def ordered(names):
+    """The projects in the order the user gave them (`zaag move`); new ones go last."""
+    try:
+        wanted = json.loads(ORDER.read_text())
+    except (OSError, ValueError):
+        wanted = []
+    rank = {name: i for i, name in enumerate(wanted)}
+    return sorted(names, key=lambda n: (rank.get(n, len(rank)), names.index(n)))
+
+
+def cmd_move(args):
+    names = ordered(live_sessions())
+    if args.session not in names:
+        raise ZaagError("no-session", f"no zellij session named {args.session}")
+    i = names.index(args.session)
+    j = {"up": i - 1, "down": i + 1, "top": 0, "bottom": len(names) - 1}[args.where]
+    j = max(0, min(len(names) - 1, j))
+    names.insert(j, names.pop(i))
+    STATE.mkdir(parents=True, exist_ok=True)
+    ORDER.write_text(json.dumps(names))
+    return {"sessions": names}
+
+
+def panes(session):
+    return [p for p in json.loads(zj(session, "list-panes", "-a", "-j")) if not p.get("is_plugin")]
+
+
+def has_clients(session):
+    try:
+        return len(zj(session, "list-clients").strip().splitlines()) > 1
+    except ZaagError:
+        return False
+
+
+def pane_id_in(out):
+    m = re.search(r"terminal_(\d+)", out)
+    if not m:
+        raise ZaagError("zellij-error", f"no pane id in: {out.strip()[:200]}")
+    return int(m.group(1))
+
+
+def screen(session, pane, full=False):
+    args = ["dump-screen", "-p", f"terminal_{pane}"]
+    if full:
+        args.append("--full")
+    return zj(session, *args).rstrip("\n")
+
+
+# ---------------------------------------------------------------- state
+
+def state_path(session, pane):
+    return AGENTS / f"{urllib.parse.quote(session, safe='')}~{pane}.json"
+
+
+def load(session, pane):
+    try:
+        return json.loads(state_path(session, pane).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def save(session, pane, st):
+    AGENTS.mkdir(parents=True, exist_ok=True)
+    st["updated"] = time.time()
+    path = state_path(session, pane)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(st))
+    os.replace(tmp, path)
+
+
+def forget(session, pane):
+    try:
+        state_path(session, pane).unlink()
+    except OSError:
+        pass
+
+
+def split_id(agent_id):
+    session, sep, pane = agent_id.rpartition(":")
+    if not sep or not pane.isdigit() or not session:
+        raise ZaagError("bad-id", f"not an agent id: {agent_id} (expected <session>:<pane>)")
+    return session, int(pane)
+
+
+# ---------------------------------------------------------------- reading the screen
+
+def dialog_options(text):
+    """The numbered choices of the dialog on screen (the last numbered block), or []."""
+    block, last = [], []
+    for raw in text.split("\n"):
+        line = re.sub(r"│\s*$", "", re.sub(r"^\s*│", "", raw))
+        m = OPTION.match(line)
+        if m:
+            block.append({"id": m.group(1), "label": m.group(2)})
+        elif line.strip():
+            if block:
+                last = block
+            block = []
+    if block:
+        last = block
+    return last if len(last) >= 2 else []
+
+
+def has_dialog(text):
+    """A dialog waiting for an answer: numbered choices, or a plain list confirmed with Enter."""
+    tail = " ".join("\n".join(text.split("\n")[-12:]).lower().split())  # a narrow pane wraps the hint
+    return bool(dialog_options(text)) or any(hint in tail for hint in ("enter to confirm", "enter to select", "enter continue"))
+
+
+def was_interrupted(text):
+    """An interrupted turn fires no hook; Claude leaves "Interrupted" as the last thing above its
+    input box. (There is no dependable sign of work on screen: while an answer streams, nothing
+    says so.)"""
+    lines = text.split("\n")
+    for i in range(len(lines) - 1, -1, -1):
+        if "Interrupted" in lines[i] and "\u23bf" in lines[i]:
+            for after in lines[i + 1:]:
+                if re.match(r"^\s*[\u2500\u2501]{10,}", after):
+                    return True
+                if after.strip():
+                    return False
+            return False
+    return False
+
+
+def clean_title(title):
+    return re.sub(r"^[^\w(\[{<\"'~/.]+", "", title or "", flags=re.UNICODE).strip()
+
+
+# ---------------------------------------------------------------- list
+
+def branch_of(cwd, cache):
+    if cwd in cache:
+        return cache[cwd]
+    branch = None
+    if cwd and os.path.isdir(cwd):
+        try:
+            p = run(["git", "-C", cwd, "--no-optional-locks", "branch", "--show-current"], timeout=2)
+            branch = p.stdout.strip() or None
+        except ZaagError:
+            pass
+    cache[cwd] = branch  # only once known: other sessions are listed at the same time
+    return branch
+
+
+def settle(session, pane, st):
+    """Hooks miss three things: a dialog that is not a permission request (trusting a folder), a
+    dialog answered (the tool then runs without a word) and an interrupted turn (no Stop). The
+    screen tells."""
+    age = time.time() - st.get("updated", 0)
+    try:
+        if st["status"] == "blocked" and age > BLOCKED_GRACE:
+            text = screen(session, pane)
+            if not has_dialog(text):
+                st["status"] = "idle" if was_interrupted(text) else "working"
+                save(session, pane, st)
+        elif st["status"] == "working" and age > WORKING_GRACE:
+            text = screen(session, pane)
+            if has_dialog(text):
+                st["status"] = "blocked"
+                save(session, pane, st)
+            elif was_interrupted(text):
+                st["status"] = "idle"
+                save(session, pane, st)
+    except ZaagError:
+        pass
+    return st
+
+
+def session_rows(session, everything, branches):
+    rows = []
+    listed = panes(session)
+    alive = set()
+    for p in listed:
+        if p.get("exited"):
+            continue
+        pane = p["id"]
+        alive.add(pane)
+        st = load(session, pane)
+        if not st and not everything:
+            continue
+        cwd = (st or {}).get("cwd") or p.get("pane_cwd") or ""
+        title = clean_title(p.get("title"))
+        if st:
+            st = settle(session, pane, st)
+        default_title = not title or re.fullmatch(r"Pane #\d+", title) or title == (p.get("pane_command") or "") or re.match(r"[\w.-]+@[\w.-]+:", title)
+        row = {
+            "id": f"{session}:{pane}",
+            "session": session,
+            "pane": pane,
+            "tab": p.get("tab_name"),
+            "tab_id": p.get("tab_id"),
+            "name": (st or {}).get("name") or (os.path.basename(cwd) if default_title else title) or f"pane {pane}",
+            "title": title,
+            "agent": (st or {}).get("agent"),
+            "status": (st or {}).get("status", "terminal"),
+            "cwd": cwd,
+            "branch": branch_of(cwd, branches),
+            "session_id": (st or {}).get("session_id"),
+            "transcript_path": (st or {}).get("transcript_path"),
+            "done_seq": (st or {}).get("done_seq", 0),
+            "updated": (st or {}).get("updated"),
+        }
+        rows.append({k: v for k, v in row.items() if v is not None})
+    # panes that are gone
+    prefix = urllib.parse.quote(session, safe="") + "~"
+    for f in AGENTS.glob(prefix + "*.json") if AGENTS.is_dir() else []:
+        pane = f.stem[len(prefix):]
+        if pane.isdigit() and int(pane) not in alive:
+            f.unlink(missing_ok=True)
+    return rows
+
+
+def local_agents(everything=False, only_session=None):
+    sessions = ordered(live_sessions())
+    if AGENTS.is_dir():  # sessions that are gone
+        known = {urllib.parse.quote(s, safe="") for s in sessions}
+        for f in AGENTS.glob("*.json"):
+            if f.stem.rpartition("~")[0] not in known:
+                f.unlink(missing_ok=True)
+    if only_session is not None:
+        sessions = [s for s in sessions if s == only_session]
+    branches = {}
+    rows = []
+
+    def one(s):
+        try:
+            return session_rows(s, everything, branches)
+        except (ZaagError, ValueError):
+            return []
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for part in pool.map(one, sessions):
+            rows.extend(part)
+    return {"agents": rows, "sessions": sessions}
+
+
+def config():
+    try:
+        c = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        c = {}
+    if "ZAAG_MACHINES" in os.environ:
+        c["machines"] = [m for m in os.environ["ZAAG_MACHINES"].split(",") if m.strip()]
+    c.setdefault("machines", [])
+    c.setdefault("label", "Mac" if sys.platform == "darwin" else os.uname().nodename.split(".")[0])
+    c.setdefault("remote_zag", "~/.local/bin/zaag")
+    return c
+
+
+def cmd_list(args):
+    if not args.machines:
+        return local_agents(args.all, args.session)
+    c = config()
+
+    def remote(host):
+        try:
+            p = ssh(host, ["list"] + (["--all"] if args.all else []), timeout=10)
+            answer = json.loads(p.stdout)
+            if "error" in answer:
+                return {"id": host, "label": host, "online": False, "reason": answer["error"]["message"], "agents": [], "sessions": []}
+            return {"id": host, "label": host, "online": True, **answer["result"]}
+        except ZaagError as e:
+            return {"id": host, "label": host, "online": False, "reason": str(e), "agents": [], "sessions": []}
+        except ValueError:
+            return {"id": host, "label": host, "online": False, "reason": "zaag not installed" if p.returncode == 127 else "offline" if p.returncode == 255 else "zaag failed", "agents": [], "sessions": []}
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        remotes = pool.map(remote, c["machines"])
+        try:
+            here = {"id": "local", "label": c["label"], "online": True, **local_agents(args.all, args.session)}
+        except ZaagError as e:
+            here = {"id": "local", "label": c["label"], "online": False, "reason": str(e), "agents": [], "sessions": []}
+        return {"machines": [here, *remotes]}
+
+
+# ---------------------------------------------------------------- remote
+
+def ssh(host, zag_args, timeout=30):
+    c = config()
+    remote = c["remote_zag"]
+    binary = '"$HOME"/' + shlex.quote(remote[2:]) if remote.startswith("~/") else shlex.quote(remote)
+    command = binary + " " + " ".join(shlex.quote(a) for a in zag_args)
+    return run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ControlMaster=auto",
+         "-o", "ControlPath=~/.ssh/zaag-%C", "-o", "ControlPersist=300", host, command],
+        timeout=timeout,
+    )
+
+
+# ---------------------------------------------------------------- commands on one agent
+
+def require(agent_id):
+    """An id is `<session>:<pane number>`, or `<session>:<name>` when one pane has that name."""
+    session, sep, last = agent_id.rpartition(":")
+    if not sep or not session or not last:
+        raise ZaagError("bad-id", f"not an agent id: {agent_id} (expected <session>:<pane> or <session>:<name>)")
+    if session not in live_sessions():
+        raise ZaagError("no-session", f"no zellij session named {session}")
+    if last.isdigit():
+        return session, int(last)
+    named = [p["id"] for p in panes(session) if not p.get("exited") and last in ((load(session, p["id"]) or {}).get("name"), clean_title(p.get("title")))]
+    if len(named) != 1:
+        raise ZaagError("gone" if not named else "ambiguous", f"{len(named)} panes named {last} in {session}")
+    return session, named[0]
+
+
+def cmd_get(args):
+    session, pane = require(args.id)
+    row = next((r for r in session_rows(session, True, {}) if r["pane"] == pane), None)
+    if row is None:
+        raise ZaagError("gone", "no such pane")
+    return row
+
+
+def cmd_read(args):
+    session, pane = require(args.id)
+    text = screen(session, pane, full=args.full)
+    lines = text.split("\n")
+    if args.lines:
+        lines = lines[-args.lines:]
+    sys.stdout.write("\n".join(lines) + "\n")
+    return None
+
+
+def cmd_prompt(args):
+    session, pane = require(args.id)
+    st = load(session, pane)
+    if st and st.get("status") == "blocked" and not args.force:
+        st = settle(session, pane, dict(st, updated=0))
+        if st["status"] == "blocked":
+            raise ZaagError("blocked", "Answer the prompt first")
+    before = (st or {}).get("done_seq", 0)
+    zj(session, "paste", "-p", f"terminal_{pane}", args.text)
+    time.sleep(0.25)  # the paste has to land before Enter, or Enter is taken as part of it
+    zj(session, "send-keys", "-p", f"terminal_{pane}", "Enter")
+    if st:
+        st = load(session, pane) or st
+        if st.get("status") != "working":
+            st["status"] = "working"
+            save(session, pane, st)
+    if not args.wait:
+        return {"id": args.id, "sent": True}
+    return wait_for(session, pane, {"done", "idle", "blocked"}, args.timeout, after_seq=before)
+
+
+def wait_for(session, pane, until, timeout, after_seq=None):
+    deadline = time.time() + timeout
+    started = time.time()
+    while time.time() < deadline:
+        st = load(session, pane)
+        if st is None and time.time() - started > 3:
+            raise ZaagError("gone", "the agent is gone")
+        if st:
+            st = settle(session, pane, st)
+            finished = st["status"] in until
+            if after_seq is not None and st["status"] in ("done", "idle"):
+                # a prompt was just sent: wait for the turn it started, not the one before
+                finished = st.get("done_seq", 0) > after_seq or time.time() - started > WORKING_GRACE + 2
+            if finished:
+                return {"id": f"{session}:{pane}", "status": st["status"], "done_seq": st.get("done_seq", 0)}
+        time.sleep(0.5)
+    raise ZaagError("timeout", f"still {(load(session, pane) or {}).get('status', 'unknown')} after {timeout}s")
+
+
+def cmd_wait(args):
+    session, pane = require(args.id)
+    return wait_for(session, pane, set(args.until.split(",")), args.timeout)
+
+
+def cmd_keys(args):
+    session, pane = require(args.id)
+    target = f"terminal_{pane}"
+    for k in args.keys:
+        named = KEYS.get(k.lower())
+        if named:
+            zj(session, "send-keys", "-p", target, named)
+        elif len(k) == 1:
+            zj(session, "write-chars", "-p", target, k)
+        else:
+            zj(session, "send-keys", "-p", target, k)  # zellij's own spelling, e.g. "Ctrl a"
+    return {"id": args.id, "sent": args.keys}
+
+
+def cmd_seen(args):
+    session, pane = split_id(args.id)
+    st = load(session, pane)
+    if st and st.get("status") == "done":
+        st["status"] = "idle"
+        save(session, pane, st)
+    return {"id": args.id, "status": (st or {}).get("status", "terminal")}
+
+
+def cmd_rename(args):
+    session, pane = require(args.id)
+    listed = panes(session)
+    me = next((p for p in listed if p["id"] == pane), None)
+    if me is None:
+        raise ZaagError("gone", "no such pane")
+    zj(session, "rename-pane", "-p", f"terminal_{pane}", args.name)
+    alone = not any(p for p in listed if p["id"] != pane and p.get("tab_id") == me.get("tab_id") and not p.get("is_floating"))
+    if alone and me.get("tab_id") is not None:
+        zj(session, "rename-tab-by-id", str(me["tab_id"]), args.name)
+    st = load(session, pane)
+    if st:
+        st["name"] = args.name
+        save(session, pane, st)
+    return {"id": args.id, "name": args.name}
+
+
+def cmd_rename_session(args):
+    if args.old not in live_sessions():
+        raise ZaagError("no-session", f"no zellij session named {args.old}")
+    if not re.fullmatch(r"[^/\s:~]+", args.new):
+        raise ZaagError("bad-name", "a project name has no space, slash, colon or tilde")
+    zj(args.old, "rename-session", args.new)
+    old = urllib.parse.quote(args.old, safe="") + "~"
+    for f in AGENTS.glob(old + "*.json") if AGENTS.is_dir() else []:
+        f.rename(AGENTS / (urllib.parse.quote(args.new, safe="") + "~" + f.name[len(old):]))
+    return {"session": args.new}
+
+
+def cmd_menu(args):
+    """Opens the searchable list of agents in a session (what Ctrl-o g does)."""
+    session = args.session or os.environ.get("ZELLIJ_SESSION_NAME")
+    if not session:
+        raise ZaagError("no-session", "give --session (not inside zellij)")
+    wasm = HOME / ".local/share/zaag/zaag-sidebar.wasm"
+    zj(session, "launch-or-focus-plugin", f"file:{wasm}", "--floating", "--move-to-focused-tab", "--configuration", f"mode=picker,zaag={Path(__file__).resolve()}")
+    return {"session": session}
+
+
+def cmd_reload(args):
+    """After an update: a session keeps the plugin it loaded, until told to load it again."""
+    session = args.session or os.environ.get("ZELLIJ_SESSION_NAME")
+    if not session:
+        raise ZaagError("no-session", "give --session (not inside zellij)")
+    if not has_clients(session):
+        raise ZaagError("nobody-attached", f"zellij only reloads a plugin in a session someone is attached to: attach to {session} first")
+    installed = HOME / ".local/bin/zaag"
+    me = installed if installed.exists() else Path(__file__).resolve()  # the path the layout gave it
+    plugins = [p for p in json.loads(zj(session, "list-panes", "-a", "-j")) if p.get("is_plugin") and "zaag-sidebar.wasm" in (p.get("plugin_url") or "")]
+    done = []
+    for url in sorted({p["plugin_url"] for p in plugins}):
+        mine = [p for p in plugins if p["plugin_url"] == url]
+        if any(p.get("title") != "agents" for p in mine):  # asking for one that is not there would open it
+            zj(session, "start-or-reload-plugin", url, "--configuration", f"mode=sidebar,zaag={me}")
+            done.append("sidebar")
+        if any(p.get("title") == "agents" for p in mine):
+            zj(session, "start-or-reload-plugin", url, "--configuration", f"mode=picker,zaag={me}")
+            done.append("list")
+    return {"session": session, "reloaded": done}
+
+
+def cmd_focus(args):
+    session, pane = require(args.id)
+    zj(session, "focus-pane-id", f"terminal_{pane}")
+    return {"id": args.id}
+
+
+def cmd_close(args):
+    session, pane = require(args.id)
+    zj(session, "close-pane", "-p", f"terminal_{pane}")
+    forget(session, pane)
+    return {"id": args.id, "closed": True}
+
+
+def cmd_new(args):
+    session = args.session or os.environ.get("ZELLIJ_SESSION_NAME")
+    if not session:
+        raise ZaagError("no-session", "give --session <project> (not inside zellij)")
+    cwd = os.path.abspath(os.path.expanduser(args.cwd)) if args.cwd else os.getcwd()
+    if not os.path.isdir(cwd):
+        raise ZaagError("bad-cwd", f"no such folder: {cwd}")
+    if args.cmd:
+        command = shlex.split(args.cmd)
+    elif args.agent == "shell":
+        command = []
+    else:
+        command = list(AGENT_COMMANDS[args.agent])
+        command += [a for a in args.agent_args if a != "--"]
+        if args.prompt and args.agent != "hermes":
+            command.append(args.prompt)
+    typed = args.prompt if args.agent == "hermes" and not args.cmd else None  # hermes takes no first prompt as an argument
+    name = args.name or os.path.basename(cwd)
+
+    tail = ["--", *command] if command else []
+    if session not in live_sessions():
+        # A new session starts with one shell pane: the agent takes its place.
+        # The session's panes inherit this environment for good: nothing of the agent calling
+        # zaag (its child-session markers, its own pane) may leak into the agents started there.
+        clean = {k: v for k, v in os.environ.items() if not re.match(r"CLAUDE_CODE_|CLAUDECODE$|CLAUDE_PROJECT_DIR$|ZELLIJ|HERDR_", k)}
+        create = [zellij_bin(), "attach", "--create-background", session]
+        if (HOME / ".config/zellij/layouts/zaag.kdl").exists():
+            create += ["options", "--default-layout", "zaag"]  # an agents session: with the sidebar
+        p = run(create, cwd=cwd, env=clean)
+        if p.returncode != 0:
+            raise ZaagError("zellij-error", (p.stderr or p.stdout).strip()[:300])
+        first = None
+        for _ in range(50):  # the session answers a moment after it is created
+            try:
+                first = panes(session)[0]
+                break
+            except (ZaagError, ValueError, IndexError):
+                time.sleep(0.1)
+        if first is None:
+            raise ZaagError("zellij-error", "the new session has no pane")
+        if command:
+            zj(session, "new-pane", "--in-place", "--close-replaced-pane", "--pane-id", f"terminal_{first['id']}", "--cwd", cwd, "--name", name, *tail)
+            pane = None
+            for _ in range(50):  # zellij does not say which pane it made in place
+                fresh = [p["id"] for p in panes(session) if p["id"] != first["id"]]
+                if fresh:
+                    pane = fresh[0]
+                    break
+                time.sleep(0.1)
+            if pane is None:
+                raise ZaagError("zellij-error", "the agent's pane did not appear")
+        else:
+            pane = first["id"]
+            zj(session, "rename-pane", "-p", f"terminal_{pane}", name)
+        if first.get("tab_id") is not None:
+            zj(session, "rename-tab-by-id", str(first["tab_id"]), name)
+    elif args.split or not has_clients(session):
+        # zellij only builds a new tab once someone is looking at the session
+        opts = ["new-pane", "--cwd", cwd, "--name", name]
+        if args.split:
+            opts += ["--direction", args.split]
+        if not args.focus:
+            opts.append("--no-focus")
+        pane = pane_id_in(zj(session, *opts, *tail))
+    else:
+        before = {p["id"] for p in panes(session)}
+        out = zj(session, "new-tab", "--name", name, "--cwd", cwd, *tail)
+        tab = int(out.strip().split()[-1])
+        mine = []
+        for _ in range(50):
+            mine = [p for p in panes(session) if p.get("tab_id") == tab and p["id"] not in before]
+            if mine:
+                break
+            time.sleep(0.1)
+        if not mine:
+            raise ZaagError("zellij-error", "the new tab has no pane")
+        pane = mine[0]["id"]
+        zj(session, "rename-pane", "-p", f"terminal_{pane}", name)
+        if not args.focus:
+            zj(session, "go-to-previous-tab")  # new-tab --no-focus leaves the tab unbuilt
+
+    if args.agent != "shell" or args.cmd:
+        save(session, pane, {"agent": args.agent if not args.cmd else os.path.basename(command[0]), "status": "working" if args.prompt else "idle", "cwd": cwd, "name": name, "done_seq": 0})
+    if typed:
+        last, still = None, 0
+        for _ in range(60):  # typed once its screen has stopped changing
+            time.sleep(0.5)
+            try:
+                now = screen(session, pane)
+            except ZaagError:
+                continue
+            still = still + 1 if now.strip() and now == last else 0
+            last = now
+            if still >= 3:
+                break
+        zj(session, "paste", "-p", f"terminal_{pane}", typed)
+        time.sleep(0.25)
+        zj(session, "send-keys", "-p", f"terminal_{pane}", "Enter")
+    return {"id": f"{session}:{pane}", "session": session, "pane": pane, "name": name, "cwd": cwd}
+
+
+# ---------------------------------------------------------------- hooks
+
+def claude_ancestor(pid):
+    """The nearest `claude` process above pid, or None."""
+    for _ in range(6):
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True, timeout=2).stdout.split(None, 1)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if len(out) < 2:
+            return None
+        if os.path.basename(out[1].strip()) == "claude":
+            return pid
+        pid = int(out[0])
+        if pid <= 1:
+            return None
+    return None
+
+
+def is_under(pid, ancestor):
+    for _ in range(12):
+        if pid == ancestor:
+            return True
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=2).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if not out or int(out) <= 1:
+            return False
+        pid = int(out)
+    return False
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def hermes_pane(cwd, sid):
+    """Hermes runs its hooks from a background service, far from the pane its screen is in: the
+    pane is the one already tied to this Hermes session, else a Hermes screen running in a zellij
+    pane in the same folder that no other session has claimed."""
+    taken = set()
+    for f in AGENTS.glob("*.json") if AGENTS.is_dir() else []:
+        try:
+            st = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if st.get("agent") != "hermes":
+            continue
+        session, _, pane = f.stem.rpartition("~")
+        if sid and st.get("session_id") == sid:
+            return urllib.parse.unquote(session), pane
+        if st.get("session_id"):
+            taken.add((urllib.parse.unquote(session), pane))
+    found = []
+    if os.path.isdir("/proc/self"):
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                if d.stat().st_uid != os.getuid() or "hermes" not in (d / "cmdline").read_bytes().decode("utf-8", "replace"):
+                    continue
+                env = (d / "environ").read_bytes().decode("utf-8", "replace").replace("\0", "\n")
+                where = os.readlink(d / "cwd")
+            except OSError:
+                continue
+            found.append((env, where))
+    else:
+        out = subprocess.run(["ps", "eww", "-U", str(os.getuid()), "-o", "command="], capture_output=True, text=True, timeout=3).stdout
+        found = [(line.replace(" ZELLIJ", "\nZELLIJ"), None) for line in out.splitlines() if "hermes" in line]
+    panes_found = []
+    for env, where in found:
+        session = re.search(r"^ZELLIJ_SESSION_NAME=(\S+)", env, flags=re.M)
+        pane = re.search(r"^ZELLIJ_PANE_ID=(\d+)", env, flags=re.M)
+        if session and pane and (session.group(1), pane.group(1)) not in taken:
+            panes_found.append((where is not None and cwd is not None and os.path.realpath(where) == os.path.realpath(cwd), session.group(1), pane.group(1)))
+    panes_found = sorted(set(panes_found), reverse=True)  # the same folder first
+    if panes_found and (panes_found[0][0] or len(panes_found) == 1):
+        return panes_found[0][1], panes_found[0][2]
+    return None, None
+
+
+def cmd_hook(args):
+    """Called by the agent itself on its own events; never fails, never prints."""
+    session = os.environ.get("ZELLIJ_SESSION_NAME")
+    pane = os.environ.get("ZELLIJ_PANE_ID")
+    if (not session or not pane) and args.agent == "hermes":
+        try:
+            peek = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            peek = {}
+        session, pane = hermes_pane(peek.get("cwd"), peek.get("session_id"))
+        sys.stdin = io.StringIO(json.dumps(peek))
+    if not session or not (pane or "").isdigit():
+        return None
+    try:
+        data = json.loads(sys.stdin.read() or "{}") if not (hasattr(sys.stdin, "isatty") and sys.stdin.isatty()) else {}
+    except ValueError:
+        data = {}
+    event = args.event or data.get("hook_event_name") or ""
+    event = PLAIN_EVENTS.get(event.lower(), event)
+    if event in HERMES_EVENTS:
+        extra = data.get("extra") or {}
+        if event == "on_session_end" and "turn_id" not in extra and "completed" not in extra:
+            return None  # the shape Hermes sends when it quits, not the end of a turn
+        interrupted = event == "agent_loop_stopped" or extra.get("interrupted")
+        event = "Interrupted" if interrupted else HERMES_EVENTS[event]
+    pane = int(pane)
+    st = load(session, pane) or {}
+    sid = data.get("session_id")
+
+    # Another agent started from inside this one (`claude -p` in its Bash tool) inherits the
+    # pane: its events are not this pane's.
+    owner = st.get("pid")
+    if owner and sid and st.get("session_id") and sid != st["session_id"] and pid_alive(owner):
+        mine = claude_ancestor(os.getppid())
+        if mine != owner and (mine is None or is_under(mine, owner)):
+            return None
+
+    if event == "SessionEnd":
+        if not sid or not st.get("session_id") or sid == st["session_id"]:
+            forget(session, pane)
+        return None
+
+    status = st.get("status", "idle")
+    if event == "SessionStart":
+        st["pid"] = claude_ancestor(os.getppid())
+        status = st.get("status", "idle") if data.get("source") == "compact" else "idle"
+        if st.get("status") == "working" and not st.get("session_id"):
+            status = "working"  # created by `zaag new --prompt`: its first turn is starting
+    elif event in ("UserPromptSubmit", "PostToolUse"):
+        status = "working"
+    elif event == "PreToolUse":
+        status = "blocked" if data.get("tool_name") in ("AskUserQuestion", "ExitPlanMode") else "working"
+    elif event == "Interrupted":
+        status = "idle"
+    elif event == "PermissionRequest":
+        status = "blocked"
+    elif event == "Notification":
+        kind = data.get("notification_type")
+        if kind in ("permission_prompt", "elicitation_dialog"):
+            status = "blocked"
+        elif kind is None and "permission" in (data.get("message") or "").lower():
+            status = "blocked"
+        else:
+            return None
+    elif event == "Stop":
+        status = "done"
+        st["done_seq"] = st.get("done_seq", 0) + 1
+    else:
+        return None
+
+    st["agent"] = args.agent
+    st["status"] = status
+    st.setdefault("done_seq", 0)
+    if sid:
+        st["session_id"] = sid
+    if data.get("transcript_path"):
+        st["transcript_path"] = data["transcript_path"]
+    if data.get("cwd") and (event == "SessionStart" or not st.get("cwd")):
+        st["cwd"] = data["cwd"]
+    save(session, pane, st)
+    return None
+
+
+# For an agent zaag does not know: `zaag hook --agent <name> --event working` from its own hooks.
+PLAIN_EVENTS = {"start": "SessionStart", "working": "UserPromptSubmit", "blocked": "PermissionRequest", "done": "Stop", "idle": "Interrupted", "end": "SessionEnd"}
+
+HERMES_EVENTS = {
+    "on_session_start": "SessionStart",
+    "pre_llm_call": "UserPromptSubmit",
+    "post_tool_call": "PostToolUse",
+    "on_session_end": "Stop",  # Hermes fires it when a turn is finalized
+    "agent_loop_stopped": "Interrupted",
+    "on_session_finalize": "SessionEnd",
+}
+
+HOOK_EVENTS = {
+    "claude": {
+        "SessionStart": None,
+        "UserPromptSubmit": None,
+        "PreToolUse": "AskUserQuestion|ExitPlanMode",
+        "PostToolUse": None,
+        "Notification": None,
+        "Stop": None,
+        "SessionEnd": None,
+    },
+    "codex": {
+        "SessionStart": None,
+        "UserPromptSubmit": None,
+        "PermissionRequest": None,
+        "PostToolUse": None,
+        "Stop": None,
+    },
+}
+HOOK_FILES = {"claude": ".claude/settings.json", "codex": ".codex/hooks.json"}
+
+
+def install_hermes_hooks():
+    """Hermes keeps its hooks in YAML (`hooks:` in ~/.hermes/config.yaml): the block is appended
+    when the file has none; otherwise it is printed for the user to merge."""
+    path = HOME / ".hermes/config.yaml"
+    command = f"{shlex.quote(str(Path(__file__).resolve()))} hook --agent hermes"
+    block = "hooks:\n" + "".join(f"  {event}:\n    - command: {json.dumps(command)}\n      timeout: 5\n" for event in HERMES_EVENTS)
+    text = path.read_text() if path.exists() else ""
+    if "hook --agent hermes" in text:
+        return {"settings": str(path), "added": [], "command": command}
+    if re.search(r"^hooks:", text, flags=re.M):
+        return {"settings": str(path), "added": [], "command": command, "merge_by_hand": block}
+    if text:
+        backup = path.with_name(path.name + ".before-zaag")
+        if not backup.exists():
+            shutil.copy2(path, backup)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + ("" if not text or text.endswith("\n") else "\n") + "\n# zaag: this pane's status, for the zellij sidebar\n" + block)
+    return {"settings": str(path), "added": list(HERMES_EVENTS), "command": command}
+
+
+def cmd_install_hooks(args):
+    """Adds `zaag hook` to the agent's hooks (idempotent; the previous file is kept)."""
+    if args.agent == "hermes":
+        return install_hermes_hooks()
+    path = HOME / HOOK_FILES[args.agent]
+    try:
+        settings = json.loads(path.read_text())
+    except OSError:
+        settings = {}
+    me = str(Path(__file__).resolve())
+    command = f"{shlex.quote(me)} hook --agent {args.agent}"
+    hooks = settings.setdefault("hooks", {})
+    added = []
+    for event, matcher in HOOK_EVENTS[args.agent].items():
+        entries = hooks.setdefault(event, [])
+        if any("zaag" in h.get("command", "") and " hook " in h.get("command", "") + " " for e in entries for h in e.get("hooks", [])):
+            continue
+        entry = {"hooks": [{"type": "command", "command": command, "timeout": 5}]}
+        if matcher:
+            entry["matcher"] = matcher
+        entries.append(entry)
+        added.append(event)
+    if added:
+        if path.exists():
+            backup = path.with_name(path.name + ".before-zaag")
+            if not backup.exists():
+                shutil.copy2(path, backup)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".zaag.tmp")
+        tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)
+    return {"settings": str(path), "added": added, "command": command}
+
+
+# ---------------------------------------------------------------- entry
+
+def parser():
+    p = argparse.ArgumentParser(prog="zaag", description="Coding agents in zellij: list, read, prompt, create.")
+    p.add_argument("-m", "--machine", help="run the command on this SSH host instead")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("list", help="the agents, with their status")
+    s.add_argument("--all", action="store_true", help="plain terminals too")
+    s.add_argument("--session", help="only this project")
+    s.add_argument("--machines", action="store_true", help="this machine and the configured SSH ones, grouped")
+    s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("read", help="an agent's screen, as text")
+    s.add_argument("id")
+    s.add_argument("--lines", type=int, default=0, help="only the last N lines")
+    s.add_argument("--full", action="store_true", help="with the scrollback")
+    s.set_defaults(fn=cmd_read)
+
+    s = sub.add_parser("prompt", help="type a prompt into an agent and submit it")
+    s.add_argument("id")
+    s.add_argument("text")
+    s.add_argument("--wait", action="store_true", help="return when the agent has finished (or is blocked)")
+    s.add_argument("--timeout", type=float, default=600)
+    s.add_argument("--force", action="store_true", help="even if a dialog is open")
+    s.set_defaults(fn=cmd_prompt)
+
+    s = sub.add_parser("keys", help="send keys: esc, enter, tab, up, down, ctrl-c, or single characters")
+    s.add_argument("id")
+    s.add_argument("keys", nargs="+")
+    s.set_defaults(fn=cmd_keys)
+
+    s = sub.add_parser("wait", help="wait until an agent reaches a status")
+    s.add_argument("id")
+    s.add_argument("--until", default="done,idle,blocked")
+    s.add_argument("--timeout", type=float, default=600)
+    s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("new", help="start an agent in a new tab (or pane) of a project's session")
+    s.add_argument("--session", help="the project; created if missing (default: the current session)")
+    s.add_argument("--cwd", help="its folder (default: here)")
+    s.add_argument("--name", help="what the tab and the agent are called")
+    s.add_argument("--agent", choices=["claude", "codex", "hermes", "shell"], default="claude")
+    s.add_argument("--cmd", help="another command line to run instead")
+    s.add_argument("--prompt", help="its first prompt")
+    s.add_argument("--split", choices=["right", "down"], help="a pane beside the current one instead of a tab")
+    s.add_argument("--focus", action="store_true", help="switch to it")
+    s.add_argument("agent_args", nargs="*", help="after --: options passed to the agent itself")
+    s.set_defaults(fn=cmd_new)
+
+    s = sub.add_parser("get", help="one agent: its status, name, folder")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_get)
+
+    s = sub.add_parser("rename", help="rename an agent (and its tab when it is alone in it)")
+    s.add_argument("id")
+    s.add_argument("name")
+    s.set_defaults(fn=cmd_rename)
+
+    s = sub.add_parser("rename-session", help="rename a project (its zellij session)")
+    s.add_argument("old")
+    s.add_argument("new")
+    s.set_defaults(fn=cmd_rename_session)
+
+    s = sub.add_parser("move", help="change a project's place in the list")
+    s.add_argument("session")
+    s.add_argument("where", choices=["up", "down", "top", "bottom"])
+    s.set_defaults(fn=cmd_move)
+
+    s = sub.add_parser("reload", help="load the updated plugin in a session that is already open")
+    s.add_argument("--session")
+    s.set_defaults(fn=cmd_reload)
+
+    s = sub.add_parser("menu", help="open the searchable list of agents (Ctrl-o g)")
+    s.add_argument("--session")
+    s.set_defaults(fn=cmd_menu)
+
+    s = sub.add_parser("seen", help="mark a finished agent as seen: done becomes idle")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_seen)
+
+    s = sub.add_parser("focus", help="focus an agent's pane in its session")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_focus)
+
+    s = sub.add_parser("close", help="close an agent's pane")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_close)
+
+    s = sub.add_parser("hook", help="(for the agents' hooks) record this pane's status")
+    s.add_argument("--agent", default="claude")
+    s.add_argument("--event")
+    s.add_argument("rest", nargs="*")
+    s.set_defaults(fn=cmd_hook)
+
+    s = sub.add_parser("install-hooks", help="add the status hooks to Claude Code's settings (or Codex's)")
+    s.add_argument("--agent", choices=["claude", "codex", "hermes"], default="claude")
+    s.set_defaults(fn=cmd_install_hooks)
+    return p
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser().parse_args(argv)
+    if args.command == "hook":
+        try:
+            cmd_hook(args)
+        except Exception:
+            pass
+        return 0
+    try:
+        if args.machine:
+            i = argv.index("-m") if "-m" in argv else argv.index("--machine")
+            p = ssh(args.machine, argv[:i] + argv[i + 2:], timeout=(getattr(args, "timeout", 0) or 0) + 30)
+            if p.returncode == 255:
+                raise ZaagError("offline", f"{args.machine} is not reachable")
+            if p.returncode == 127:
+                raise ZaagError("zaag-missing", f"zaag is not installed on {args.machine}")
+            sys.stdout.write(p.stdout)
+            return p.returncode
+        result = args.fn(args)
+        if result is not None:
+            print(json.dumps({"result": result}))
+        return 0
+    except ZaagError as e:
+        print(json.dumps({"error": {"code": e.code, "message": str(e)}}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
