@@ -115,4 +115,4 @@ else
 fi
 
 echo
-echo "Open an agents session with:  zellij -s <project> --layout zaag"
+echo "Open a project with:  zaag attach <project>"

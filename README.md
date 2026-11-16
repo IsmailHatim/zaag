@@ -39,7 +39,7 @@ keeps the plugin it loaded until you run `zaag reload` in it.
 ## Use
 
 ```bash
-zellij -s myproject --layout zaag     # a project session with the sidebar; start claude, codex or hermes in it
+zaag attach myproject     # opens the project (created with the sidebar if new); start claude, codex or hermes in it
 ```
 
 - **Sidebar**: projects on top (dot = their most urgent agent, branch under the name), agents
@@ -49,12 +49,15 @@ zellij -s myproject --layout zaag     # a project session with the sidebar; star
 - **Ctrl-o g**, from any session: the list of every agent. Type to filter, ↑↓, Enter to go,
   Ctrl-r to rename the agent or the project under the cursor, Ctrl-u / Ctrl-d to move its project
   up or down in the list (also `zaag move <project> up|down|top|bottom`), Esc to close.
+- `zaag attach` without a name uses the current folder's name. It is `zellij attach --create`
+  with the `zaag` layout: `zellij -s myproject --layout zaag` does the same for a new session.
 - A plain `zellij` stays plain; a session opened without the layout gets the sidebar with
   `zellij action override-layout zaag`.
 
 ## The command
 
 ```bash
+zaag attach [P]                                # open a project in this terminal
 zaag list [--all] [--session P] [--machines]   # agents (with --all, plain terminals too)
 zaag new [--session P] [--cwd D] [--name N] [--agent claude|codex|hermes|shell] [--prompt T] [--split right|down] [--focus] [-- agent options]
 zaag get <id>                  # one agent: status, name, folder

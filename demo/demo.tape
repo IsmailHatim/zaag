@@ -16,7 +16,7 @@ Type "sh demo/setup.sh && clear" Enter
 Sleep 5s
 Show
 
-Type "zellij attach webapp" Sleep 400ms Enter
+Type "zaag attach webapp" Sleep 400ms Enter
 Sleep 6s
 Ctrl+O Sleep 300ms Type "g"
 Sleep 1800ms

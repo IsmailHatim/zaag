@@ -520,6 +520,19 @@ def cmd_menu(args):
     return {"session": session}
 
 
+def cmd_attach(args):
+    """Opens a project in this terminal: its session, made with the sidebar when it is new."""
+    if os.environ.get("ZELLIJ_SESSION_NAME"):
+        raise ZaagError("inside-zellij", "already inside zellij: go to another project with Ctrl-o g, or click it in the sidebar")
+    name = args.session or os.path.basename(os.getcwd())
+    if not re.fullmatch(r"[^/\s:~]+", name):
+        raise ZaagError("bad-name", f"a project name has no space, slash, colon or tilde: {name}")
+    command = [zellij_bin(), "attach", "--create", name]
+    if (HOME / ".config/zellij/layouts/zaag.kdl").exists():
+        command += ["options", "--default-layout", "zaag"]
+    os.execv(command[0], command)
+
+
 def cmd_reload(args):
     """After an update: a session keeps the plugin it loaded, until told to load it again."""
     session = args.session or os.environ.get("ZELLIJ_SESSION_NAME")
@@ -980,6 +993,10 @@ def parser():
     s.add_argument("session")
     s.add_argument("where", choices=["up", "down", "top", "bottom"])
     s.set_defaults(fn=cmd_move)
+
+    s = sub.add_parser("attach", help="open a project here: attach to its session, or start it with the sidebar")
+    s.add_argument("session", nargs="?", help="the project (default: this folder's name)")
+    s.set_defaults(fn=cmd_attach)
 
     s = sub.add_parser("reload", help="load the updated plugin in a session that is already open")
     s.add_argument("--session")
