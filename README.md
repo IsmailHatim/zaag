@@ -1,4 +1,8 @@
+<p align="center"><img src="assets/logo.png" width="140" alt="zaag logo"></p>
+
 # zaag
+
+![The zaag sidebar and agents list in zellij](assets/demo.gif)
 
 Coding agents in [zellij](https://zellij.dev): one zellij session per project, one pane per agent
 (Claude Code, Codex, Hermes). zaag adds what zellij lacks for that:
@@ -138,6 +142,7 @@ Remove the `zaag hook` entries from `~/.claude/settings.json`, `~/.codex/hooks.j
 ```bash
 python3 -m unittest discover -s tests
 ./build-plugin.sh        # rebuilds dist/zaag-sidebar.wasm
+vhs demo/demo.tape       # records assets/demo.gif again, with stand-in agents in a throwaway zellij
 ```
 
 If you only want a sidebar of Claude Code sessions, look at

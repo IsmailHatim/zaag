@@ -579,7 +579,7 @@ def cmd_new(args):
         # A new session starts with one shell pane: the agent takes its place.
         # The session's panes inherit this environment for good: nothing of the agent calling
         # zaag (its child-session markers, its own pane) may leak into the agents started there.
-        clean = {k: v for k, v in os.environ.items() if not re.match(r"CLAUDE_CODE_|CLAUDECODE$|CLAUDE_PROJECT_DIR$|ZELLIJ|HERDR_", k)}
+        clean = {k: v for k, v in os.environ.items() if not re.match(r"CLAUDE_CODE_|CLAUDECODE$|CLAUDE_PROJECT_DIR$|ZELLIJ$|ZELLIJ_SESSION_NAME$|ZELLIJ_PANE_ID$|HERDR_", k)}
         create = [zellij_bin(), "attach", "--create-background", session]
         if (HOME / ".config/zellij/layouts/zaag.kdl").exists():
             create += ["options", "--default-layout", "zaag"]  # an agents session: with the sidebar
