@@ -158,6 +158,32 @@ class Reported(unittest.TestCase):
         self.assertIsNone(zaag.load("proj", 77))
 
 
+class Zellij(unittest.TestCase):
+    def test_a_pane_list_that_is_not_json_is_asked_again(self):
+        answers = iter(["There is no active session!\n", "", '[{"id": 1, "is_plugin": false}, {"id": 0, "is_plugin": true}]'])
+        with mock.patch.object(zaag, "zj", side_effect=lambda *a, **k: next(answers)), mock.patch.object(zaag.time, "sleep"):
+            self.assertEqual([p["id"] for p in zaag.panes("proj")], [1])
+
+    def test_and_is_a_plain_error_when_it_never_comes(self):
+        with mock.patch.object(zaag, "zj", return_value="nope"), mock.patch.object(zaag.time, "sleep"):
+            with self.assertRaises(zaag.ZaagError) as e:
+                zaag.panes("proj")
+        self.assertEqual(e.exception.code, "zellij-error")
+
+    def test_a_remote_project_opens_in_a_tab_through_the_other_machines_zaag(self):
+        calls = []
+        args = zaag.parser().parse_args(["-m", "devbox", "attach", "api", "--pane", "4", "--in", "webapp"])
+        with mock.patch.object(zaag, "all_panes", return_value=[{"tab_name": "Tab #1"}]), mock.patch.object(zaag, "zj", side_effect=lambda *a, **k: calls.append(a) or ""), \
+                mock.patch.object(zaag, "config", return_value={"remote_zag": "~/.local/bin/zaag"}):
+            out = zaag.attach_remote(args)
+        self.assertEqual(out["tab"], "devbox:api")
+        self.assertEqual(calls[0], ("webapp", "new-tab", "--name", "devbox:api", "--close-on-exit", "--", "ssh", "-t", "devbox", '"$HOME"/.local/bin/zaag attach api --pane 4'))
+        with mock.patch.object(zaag, "all_panes", return_value=[{"tab_name": "devbox:api"}]), mock.patch.object(zaag, "zj", side_effect=lambda *a, **k: calls.append(a) or ""), \
+                mock.patch.object(zaag, "config", return_value={"remote_zag": "~/.local/bin/zaag"}):
+            zaag.attach_remote(args)
+        self.assertEqual(calls[1], ("webapp", "go-to-tab-name", "devbox:api"))
+
+
 class Background(unittest.TestCase):
     """Claude Code sessions that run in its background service and are only shown in a pane."""
 

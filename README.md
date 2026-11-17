@@ -114,8 +114,22 @@ List their SSH names in `~/.config/zaag/config.json` (`ZAAG_MACHINES=a,b` overri
 
 Each needs zellij, this repo and `./install.sh --no-plugin`, and `ssh <name>` must work without a
 password prompt. Their agents then show in the sidebar and the list within two seconds, grouped
-by machine; an unreachable machine is shown as offline. Going to a remote agent is not automatic
-yet: attach to that machine's zellij (`ssh -t <name> zellij attach <session>`).
+by machine; an unreachable machine is shown as offline. Click a remote agent or project (or Enter
+on it in the list) and it opens in a tab of the session you are in: that machine's zellij, over
+SSH, with the agent's pane in front. From a terminal, `zaag -m <name> attach <session>` does the
+same there. (A bare `ssh <name> zellij attach` often fails with "command not found": without a
+login shell, `~/.local/bin` is not on the PATH. zaag asks the other machine's zaag, which knows
+where its zellij is.) A zellij inside a zellij takes its keys after the outer one. zellij 0.46
+notices the inner session and asks once how to control it ("on focus" suits a tab); Ctrl-o ] then
+gives the keys back to the outer session and Ctrl-o [ to the inner one (with your own keybindings,
+bind `FocusHostSession` and `FocusGuestSession`). On 0.45, lock the outer one (Ctrl-g) while you
+work in the tab.
+
+A session nobody is attached to is only 50 columns wide in zellij, so an agent's screen read from
+there wraps every few words. zellij has no size option for a background session, but a session
+keeps the size of its last client: when zaag creates a session, adds a pane to one, or reads from
+one that nobody is attached to and that is narrow, it attaches for a moment on a 200x50 terminal
+of its own.
 
 ## Statuses
 

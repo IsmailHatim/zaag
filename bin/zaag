@@ -111,8 +111,76 @@ def cmd_move(args):
     return {"sessions": names}
 
 
+def all_panes(session):
+    """Every pane of a session. zellij sometimes answers something that is not the list (a session
+    just created, or busy): asked again before giving up."""
+    out = ""
+    for _ in range(5):
+        out = zj(session, "list-panes", "-a", "-j")
+        try:
+            listed = json.loads(out)
+            if isinstance(listed, list):
+                return listed
+        except ValueError:
+            pass
+        time.sleep(0.2)
+    raise ZaagError("zellij-error", f"zellij did not list the panes of {session}: {out.strip()[:200] or 'empty answer'}")
+
+
 def panes(session):
-    return [p for p in json.loads(zj(session, "list-panes", "-a", "-j")) if not p.get("is_plugin")]
+    return [p for p in all_panes(session) if not p.get("is_plugin")]
+
+
+WIDE, TALL = 200, 50
+
+
+def roomy(session):
+    """A session nobody looks at is 50 columns wide: with a sidebar and two panes side by side, an
+    agent's screen wraps every few words and its dialogs cannot be read. zellij has no size option
+    for a background session, but a session keeps the size of its last client: one of our own
+    attaches for a moment on a terminal of 200x50. Sessions someone is attached to are left alone."""
+    try:
+        if has_clients(session) or max((p.get("pane_x", 0) + p.get("pane_columns", 0) for p in all_panes(session)), default=WIDE) >= 120:
+            return False
+        import fcntl, pty, select, signal, struct, termios
+    except (ZaagError, ImportError):
+        return False
+    binary = zellij_bin()
+    clean = {k: v for k, v in os.environ.items() if not re.match(r"ZELLIJ$|ZELLIJ_SESSION_NAME$|ZELLIJ_PANE_ID$", k)}
+    clean.setdefault("TERM", "xterm-256color")
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            os.execve(binary, [binary, "attach", session], clean)
+        finally:
+            os._exit(127)
+
+    def drain(seconds):  # the client's output has to be read, or it waits on us; True once it is gone
+        end = time.time() + seconds
+        while time.time() < end:
+            if select.select([fd], [], [], 0.1)[0]:
+                try:
+                    if not os.read(fd, 65536):
+                        return True
+                except OSError:
+                    return True
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                return True
+        return False
+
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", TALL, WIDE, 0, 0))
+        gone = drain(1.5)
+        for sig in (signal.SIGHUP, signal.SIGKILL):
+            if gone:
+                break
+            os.kill(pid, sig)
+            gone = drain(2)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+    return True
 
 
 def has_clients(session):
@@ -618,6 +686,8 @@ def cmd_get(args):
 
 def cmd_read(args):
     session, pane = require(args.id)
+    if roomy(session):
+        time.sleep(0.5)  # the agent draws its screen again at the new width
     text = screen(session, pane, full=args.full)
     lines = text.split("\n")
     if args.lines:
@@ -737,8 +807,33 @@ def cmd_menu(args):
     return {"session": session}
 
 
+def attach_remote(args):
+    """A project on another machine: in this terminal, or, from inside zellij (or for `--in`), in a
+    tab of its own here. The other machine's zaag does the attaching: it knows where its zellij is,
+    which a bare `ssh host zellij` does not (no login shell, so no ~/.local/bin on the PATH)."""
+    c = config()
+    remote = c["remote_zag"]
+    binary = '"$HOME"/' + shlex.quote(remote[2:]) if remote.startswith("~/") else shlex.quote(remote)
+    there = [binary, "attach"] + ([shlex.quote(args.session)] if args.session else []) + (["--pane", str(args.pane)] if args.pane is not None else [])
+    command = ["ssh", "-t", args.machine, " ".join(there)]
+    here = args.inside or os.environ.get("ZELLIJ_SESSION_NAME")
+    if not here:
+        os.execvp(command[0], command)
+    name = f"{args.machine}:{args.session}" if args.session else args.machine
+    if any(p.get("tab_name") == name for p in all_panes(here)):
+        zj(here, "go-to-tab-name", name)  # already open here
+    else:
+        zj(here, "new-tab", "--name", name, "--close-on-exit", "--", *command)
+    return {"machine": args.machine, "session": args.session, "tab": name, "in": here}
+
+
 def cmd_attach(args):
     """Opens a project in this terminal: its session, made with the sidebar when it is new."""
+    if args.pane is not None and args.session:
+        try:
+            zj(args.session, "focus-pane-id", f"terminal_{args.pane}")  # the agent asked for, in front
+        except ZaagError:
+            pass
     if os.environ.get("ZELLIJ_SESSION_NAME"):
         raise ZaagError("inside-zellij", "already inside zellij: go to another project with Ctrl-o g, or click it in the sidebar")
     name = args.session or os.path.basename(os.getcwd())
@@ -759,7 +854,7 @@ def cmd_reload(args):
         raise ZaagError("nobody-attached", f"zellij only reloads a plugin in a session someone is attached to: attach to {session} first")
     installed = HOME / ".local/bin/zaag"
     me = installed if installed.exists() else Path(__file__).resolve()  # the path the layout gave it
-    plugins = [p for p in json.loads(zj(session, "list-panes", "-a", "-j")) if p.get("is_plugin") and "zaag-sidebar.wasm" in (p.get("plugin_url") or "")]
+    plugins = [p for p in all_panes(session) if p.get("is_plugin") and "zaag-sidebar.wasm" in (p.get("plugin_url") or "")]
     done = []
     for url in sorted({p["plugin_url"] for p in plugins}):
         mine = [p for p in plugins if p["plugin_url"] == url]
@@ -810,6 +905,7 @@ def cmd_new(args):
         # The session's panes inherit this environment for good: nothing of the agent calling
         # zaag (its child-session markers, its own pane) may leak into the agents started there.
         clean = {k: v for k, v in os.environ.items() if not re.match(r"CLAUDE_CODE_|CLAUDECODE$|CLAUDE_PROJECT_DIR$|ZELLIJ$|ZELLIJ_SESSION_NAME$|ZELLIJ_PANE_ID$|HERDR_", k)}
+        clean.setdefault("TERM", "xterm-256color")  # started over ssh without a terminal: the panes need one
         create = [zellij_bin(), "attach", "--create-background", session]
         if (HOME / ".config/zellij/layouts/zaag.kdl").exists():
             create += ["options", "--default-layout", "zaag"]  # an agents session: with the sidebar
@@ -825,6 +921,7 @@ def cmd_new(args):
                 time.sleep(0.1)
         if first is None:
             raise ZaagError("zellij-error", "the new session has no pane")
+        roomy(session)
         if command:
             # A session this young sometimes answers "There is no active session!" to a call it
             # then carries out: what counts is whether the agent's pane is there.
@@ -845,6 +942,7 @@ def cmd_new(args):
         if first.get("tab_id") is not None:
             quietly(session, "rename-tab-by-id", str(first["tab_id"]), name)
     elif args.split or not has_clients(session):
+        roomy(session)
         # zellij only builds a new tab once someone is looking at the session
         # ...and only places a pane "right" or "down" of the pane someone is on: with nobody
         # attached it answers with a pane id and makes nothing, so zellij picks the place then.
@@ -1288,6 +1386,8 @@ def parser():
 
     s = sub.add_parser("attach", help="open a project here: attach to its session, or start it with the sidebar")
     s.add_argument("session", nargs="?", help="the project (default: this folder's name)")
+    s.add_argument("--pane", type=int, help="with this pane in front")
+    s.add_argument("--in", dest="inside", metavar="SESSION", help="with -m: open it in a new tab of this local session")
     s.set_defaults(fn=cmd_attach)
 
     s = sub.add_parser("reload", help="load the updated plugin in a session that is already open")
@@ -1332,6 +1432,10 @@ def main(argv=None):
             pass
         return 0
     try:
+        if args.machine and args.command == "attach":
+            result = attach_remote(args)
+            print(json.dumps({"result": result}))
+            return 0
         if args.machine:
             i = argv.index("-m") if "-m" in argv else argv.index("--machine")
             p = ssh(args.machine, argv[:i] + argv[i + 2:], timeout=(getattr(args, "timeout", 0) or 0) + 30)

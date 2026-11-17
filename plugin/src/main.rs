@@ -290,13 +290,21 @@ impl State {
                     switch_session(Some(name));
                 }
             }
-            Target::Agent { machine, agent } => {
-                self.note = Some(format!("on {machine}: ssh -t {machine} zellij attach {}", agent.session));
-            }
-            Target::Session { machine, name } => {
-                self.note = Some(format!("on {machine}: ssh -t {machine} zellij attach {name}"));
-            }
+            Target::Agent { machine, agent } => self.open_remote(machine, &agent.session, Some(agent.pane)),
+            Target::Session { machine, name } => self.open_remote(machine, name, None),
         }
+    }
+
+    /// A project on another machine opens in a tab of this session: its zellij, over ssh.
+    fn open_remote(&mut self, machine: &str, session: &str, pane: Option<u32>) {
+        let Some(here) = self.session.clone() else { return };
+        let pane = pane.map(|p| p.to_string());
+        let mut args = vec!["-m", machine, "attach", session, "--in", &here];
+        if let Some(p) = &pane {
+            args.extend_from_slice(&["--pane", p]);
+        }
+        self.zaag(&args, "remote");
+        self.note = Some(format!("opening {session} on {machine}…"));
     }
 
     // ------------------------------------------------------------ sidebar
@@ -726,6 +734,14 @@ impl ZellijPlugin for State {
                         self.mark_seen();
                     } else {
                         self.silent = true;
+                    }
+                    true
+                }
+                Some("remote") => {
+                    let refused = serde_json::from_slice::<Refusal>(&stdout).ok().and_then(|r| r.error).map(|e| e.message);
+                    self.note = refused.or_else(|| stdout.is_empty().then(|| "could not open it: is zaag up to date on both machines?".to_string()));
+                    if self.note.is_none() && self.mode == Mode::Picker {
+                        self.close_picker();
                     }
                     true
                 }
