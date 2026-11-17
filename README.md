@@ -27,7 +27,7 @@ zellij itself is untouched: no fork, no patch.
 
 ## Install
 
-Needs zellij 0.45 or later and python3.
+Needs zellij 0.45 or later (tested on 0.45.1 and 0.46.0) and python3.
 
 ```bash
 git clone https://github.com/IsmailHatim/zaag.git && cd zaag
@@ -135,6 +135,17 @@ background service, so zaag finds the pane by the Hermes session, then by the fo
 Claude Code can also run a session in its own background service and only display it in a pane:
 zaag ties the two by the pane's title, which is the session's name, or, for a pane you renamed,
 by finding the session whose last words are on the pane's screen.
+
+### On zellij 0.46
+
+zellij 0.46 has an inbox: agents tell the terminal what they are doing (OSC 7501: working, blocked
+with their question, done) and zellij gathers it. zaag reads that same state from zellij, so on
+0.46 an agent that reports this way is listed with its status **without any hook**, and a blocked
+agent's question shows in `zaag list` (`message`) and under its name in the sidebar. An agent whose
+hooks have spoken keeps its hook status: hooks also cover what a program does not report, and they
+are all there is on 0.45. Looking at a finished agent in zaag marks it seen in zellij's inbox too.
+The inbox is where you answer what needs you; zaag is the list of every agent, the command they
+drive each other with, and the other machines.
 
 The plugin only draws what `zaag list --machines` answers, asked every 2 seconds while visible.
 

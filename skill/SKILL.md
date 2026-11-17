@@ -22,7 +22,8 @@ zaag get webapp:4                # one agent
 ```
 
 Status: `idle`, `working`, `blocked` (a dialog is waiting for an answer), `done` (finished, not
-looked at yet).
+looked at yet). A `blocked` agent may carry `message`: what it is asking (zellij 0.46
+and later).
 
 ## Start an agent
 

@@ -172,6 +172,8 @@ def load(session, pane):
 
 
 def save(session, pane, st):
+    if st.get("reported"):
+        return  # zellij's own account of the pane: read again each time, never kept
     AGENTS.mkdir(parents=True, exist_ok=True)
     st["updated"] = time.time()
     path = state_path(session, pane)
@@ -185,6 +187,58 @@ def forget(session, pane):
         state_path(session, pane).unlink()
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------- what zellij knows (0.46 and later)
+
+REPORTED = {"idle": "idle", "working": "working", "blocked": "blocked", "done": "done", "error": "done"}
+
+
+def reported(p):
+    """What the program in a pane says about itself (OSC 7501), as zellij 0.46 and later keep it
+    in `list-panes`: a state in zaag's words, never saved. None on an older zellij, or for a
+    program that says nothing. An agent that reports this way needs no hook."""
+    records = [r for r in p.get("program_status") or [] if isinstance(r, dict)]
+    if not records:
+        return None
+    last = max(records, key=lambda r: r.get("updated_ms") or 0)
+    state = str(last.get("state") or "").lower()
+    if state not in REPORTED:
+        return None
+    status = REPORTED[state]
+    if status == "done" and str((p.get("attention") or {}).get("status") or "").lower() not in ("done", "failed"):
+        status = "idle"  # finished and looked at, in zellij's inbox or here: zellij no longer flags it
+    at = last.get("updated_ms") or 0
+    told = {
+        "reported": True,
+        "agent": re.sub(r"[-_ ](code|cli)$", "", str(last.get("app") or "").lower()) or None,
+        "status": status,
+        "updated": at / 1000,
+        "done_seq": at if state in ("done", "error") else 0,
+    }
+    if last.get("msg"):
+        told["message"] = " ".join(str(last["msg"]).split())
+    return told
+
+
+def known(st, told):
+    """Hooks first: they also see what a program does not report. Until a hook has spoken (no
+    hooks installed, or only the name `zaag new` wrote down), the program's own word counts."""
+    if told and not (st or {}).get("session_id"):
+        return dict(st or {}, **{k: v for k, v in told.items() if v is not None})
+    return st
+
+
+def state_of(session, pane):
+    """The agent's state: what its hooks wrote, else what it told zellij."""
+    st = load(session, pane)
+    if st and st.get("session_id"):
+        return st
+    try:
+        me = next((p for p in panes(session) if p["id"] == pane), None)
+    except (ZaagError, ValueError):
+        return st
+    return known(st, reported(me)) if me else st
 
 
 def split_id(agent_id):
@@ -259,6 +313,8 @@ def settle(session, pane, st):
     """Hooks miss four things: the menus an agent shows before its first hook (trust this folder,
     review these hooks), a dialog that is not a permission request, a dialog answered (the tool
     then runs without a word) and an interrupted turn (no Stop). The screen tells."""
+    if st.get("reported") and st["status"] != "idle":
+        return st  # the program's own word; only a start-up menu comes before it says anything
     age = time.time() - st.get("updated", 0)
     starting = not st.get("session_id")  # no hook has spoken yet
     try:
@@ -414,6 +470,8 @@ def session_rows(session, everything, branches, background=None, taken=None):
         if background:
             st = adopt(session, p, st, background)
             st = adopt_by_screen(session, p, st, background, taken or set())
+        told = reported(p)
+        st = known(st, told)
         if not st and not everything:
             continue
         cwd = (st or {}).get("cwd") or p.get("pane_cwd") or ""
@@ -431,6 +489,7 @@ def session_rows(session, everything, branches, background=None, taken=None):
             "title": title,
             "agent": (st or {}).get("agent"),
             "status": (st or {}).get("status", "terminal"),
+            "message": told.get("message") if told and st and told["status"] == st["status"] else None,
             "cwd": cwd,
             "branch": branch_of(cwd, branches),
             "session_id": (st or {}).get("session_id"),
@@ -569,7 +628,7 @@ def cmd_read(args):
 
 def cmd_prompt(args):
     session, pane = require(args.id)
-    st = load(session, pane)
+    st = state_of(session, pane)
     if st and st.get("status") == "blocked" and not args.force:
         st = settle(session, pane, dict(st, updated=0))
         if st["status"] == "blocked":
@@ -578,7 +637,7 @@ def cmd_prompt(args):
     zj(session, "paste", "-p", f"terminal_{pane}", args.text)
     time.sleep(0.25)  # the paste has to land before Enter, or Enter is taken as part of it
     zj(session, "send-keys", "-p", f"terminal_{pane}", "Enter")
-    if st:
+    if st and not st.get("reported"):
         st = load(session, pane) or st
         if st.get("status") != "working":
             st["status"] = "working"
@@ -592,7 +651,7 @@ def wait_for(session, pane, until, timeout, after_seq=None):
     deadline = time.time() + timeout
     started = time.time()
     while time.time() < deadline:
-        st = load(session, pane)
+        st = state_of(session, pane)
         if st is None and time.time() - started > 3:
             raise ZaagError("gone", "the agent is gone")
         if st:
@@ -604,7 +663,7 @@ def wait_for(session, pane, until, timeout, after_seq=None):
             if finished:
                 return {"id": f"{session}:{pane}", "status": st["status"], "done_seq": st.get("done_seq", 0)}
         time.sleep(0.5)
-    raise ZaagError("timeout", f"still {(load(session, pane) or {}).get('status', 'unknown')} after {timeout}s")
+    raise ZaagError("timeout", f"still {(state_of(session, pane) or {}).get('status', 'unknown')} after {timeout}s")
 
 
 def cmd_wait(args):
@@ -632,6 +691,10 @@ def cmd_seen(args):
     if st and st.get("status") == "done":
         st["status"] = "idle"
         save(session, pane, st)
+    try:
+        zj(session, "mark-pane-seen", "-p", f"terminal_{pane}")  # zellij 0.46: its inbox agrees
+    except ZaagError:
+        pass
     return {"id": args.id, "status": (st or {}).get("status", "terminal")}
 
 

@@ -30,6 +30,8 @@ struct Agent {
     status: String,
     #[serde(default)]
     branch: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Default, Debug)]
@@ -356,7 +358,11 @@ impl State {
             if m.id != "local" {
                 second.push_str(&format!(" · {}", m.label));
             }
-            lines.push(Line { left: vec![seg(second, DIM)], bg, target, ..Default::default() });
+            let mut left = vec![seg(second, DIM)];
+            if let Some(asked) = a.message.as_ref().filter(|_| a.status == "blocked") {
+                left.push(seg(format!(" · {asked}"), RED)); // what it is waiting for (zellij 0.46)
+            }
+            lines.push(Line { left, bg, target, ..Default::default() });
         }
         if let Some(note) = &self.note {
             lines.push(Line::default());

@@ -107,6 +107,57 @@ class Settle(unittest.TestCase):
         self.assertEqual(self.settle({"agent": "claude", "status": "blocked", "session_id": "s"}, "⏺ running\n"), "working")
 
 
+class Reported(unittest.TestCase):
+    """zellij 0.46 keeps what a program says about itself (OSC 7501) in `list-panes`."""
+
+    def pane(self, state, seen=False, **more):
+        record = dict({"state": state, "app": "claude-code", "updated_ms": 5000}, **more)
+        flagged = "Idle" if seen else {"Error": "Failed", "Blocked": "NeedsYou"}.get(state, state)
+        return {"id": 1, "title": "t", "program_status": [record], "attention": {"status": flagged}}
+
+    def rows(self, pane, st=None):
+        with mock.patch.object(zaag, "panes", return_value=[pane]), mock.patch.object(zaag, "load", return_value=st), \
+                mock.patch.object(zaag, "screen", return_value=""), mock.patch.object(zaag, "branch_of", return_value=None):
+            return zaag.session_rows("proj", False, {})
+
+    def test_an_older_zellij_says_nothing(self):
+        self.assertIsNone(zaag.reported({"id": 1, "title": "t"}))
+        self.assertEqual(self.rows({"id": 1, "title": "t"}), [])
+
+    def test_an_agent_without_hooks_is_listed_from_what_it_told_zellij(self):
+        row = self.rows(self.pane("Blocked", kind="Question", msg="Tea or\ncoffee?"))[0]
+        self.assertEqual((row["agent"], row["status"], row["message"]), ("claude", "blocked", "Tea or coffee?"))
+
+    def test_done_is_idle_once_it_was_seen_and_a_failure_is_done(self):
+        self.assertEqual(zaag.reported(self.pane("Done"))["status"], "done")
+        self.assertEqual(zaag.reported(self.pane("Done", seen=True))["status"], "idle")
+        self.assertEqual(zaag.reported(self.pane("Error"))["status"], "done")
+
+    def test_the_latest_report_counts(self):
+        pane = self.pane("Working")
+        pane["program_status"].append({"state": "Done", "updated_ms": 9000})
+        pane["attention"] = {"status": "Done"}
+        self.assertEqual(zaag.reported(pane)["status"], "done")
+
+    def test_hooks_come_first_and_the_message_only_goes_with_the_same_status(self):
+        hooked = {"agent": "claude", "status": "blocked", "session_id": "s", "updated": 0}
+        with mock.patch.object(zaag, "save"):
+            row = self.rows(self.pane("Working", msg="Compiling"), st=hooked)[0]
+        self.assertEqual(row["status"], "working")  # no dialog on the screen: settled by the hooks' rules
+        self.assertEqual(row.get("message"), "Compiling")
+        with mock.patch.object(zaag, "save"), mock.patch.object(zaag, "has_dialog", return_value=True):
+            row = self.rows(self.pane("Working", msg="Compiling"), st=dict(hooked))[0]
+        self.assertEqual((row["status"], row.get("message")), ("blocked", None))
+
+    def test_a_name_given_by_zaag_new_is_kept_until_a_hook_speaks(self):
+        row = self.rows(self.pane("Blocked", msg="Deploy?"), st={"agent": "sh", "name": "deploy", "status": "idle"})[0]
+        self.assertEqual((row["name"], row["agent"], row["status"], row["message"]), ("deploy", "claude", "blocked", "Deploy?"))
+
+    def test_it_is_never_written_down(self):
+        zaag.save("proj", 77, zaag.reported(self.pane("Done")))
+        self.assertIsNone(zaag.load("proj", 77))
+
+
 class Background(unittest.TestCase):
     """Claude Code sessions that run in its background service and are only shown in a pane."""
 
