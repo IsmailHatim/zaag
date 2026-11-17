@@ -1,6 +1,14 @@
+<h1 align="center">zaag</h1>
+
 <p align="center"><img src="assets/logo.png" width="140" alt="zaag logo"></p>
 
-# zaag
+<p align="center">
+  <a href="https://zellij.dev"><img alt="zellij" src="https://img.shields.io/badge/zellij-0.45+-informational"></a>
+  <a href="https://www.python.org/downloads/"><img alt="Python" src="https://img.shields.io/badge/Python-3-informational?logo=python&logoColor=white"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-lightgrey"></a>
+  <a href="https://github.com/IsmailHatim/zaag/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/IsmailHatim/zaag?logo=github&color=yellow"></a>
+  <a href="https://github.com/IsmailHatim/zaag/commits"><img alt="Last commit" src="https://img.shields.io/github/last-commit/IsmailHatim/zaag?color=teal"></a>
+</p>
 
 ![The zaag sidebar and agents list in zellij](assets/demo.gif)
 
@@ -47,7 +55,8 @@ zaag attach myproject     # opens the project (created with the sidebar if new);
   or an agent to go there, also across sessions; **new** starts an agent in the current project,
   **menu** opens the list.
 - **Ctrl-o g**, from any session: the list of every agent. Type to filter, ↑↓, Enter to go,
-  Ctrl-r to rename the agent or the project under the cursor, Ctrl-u / Ctrl-d to move its project
+  Ctrl-e (or Alt-Enter) to type a prompt for the agent under the cursor and send it without
+  leaving where you are, Ctrl-r to rename the agent or the project under the cursor, Ctrl-u / Ctrl-d to move its project
   up or down in the list (also `zaag move <project> up|down|top|bottom`), Esc to close.
 - `zaag attach` without a name uses the current folder's name. It is `zellij attach --create`
   with the `zaag` layout: `zellij -s myproject --layout zaag` does the same for a new session.
