@@ -124,7 +124,8 @@ request, a dialog that was answered, an interrupted turn. Codex has no "session 
 Codex that quit keeps its last status until its pane closes. Hermes runs its hooks from a
 background service, so zaag finds the pane by the Hermes session, then by the folder it runs in.
 Claude Code can also run a session in its own background service and only display it in a pane:
-zaag ties the two by the pane's title, which is the session's name.
+zaag ties the two by the pane's title, which is the session's name, or, for a pane you renamed,
+by finding the session whose last words are on the pane's screen.
 
 The plugin only draws what `zaag list --machines` answers, asked every 2 seconds while visible.
 

@@ -298,6 +298,87 @@ def background_claudes():
     return found
 
 
+def claude_log(home, cwd, sid):
+    """The log of a Claude session: under its folder's name, or wherever the session started."""
+    home = Path(home)
+    log = home / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd or "") / (sid + ".jsonl")
+    if log.exists():
+        return log
+    return next(iter((home / "projects").glob(f"*/{sid}.jsonl")), None)
+
+
+def squeeze(text):
+    """Letters and digits only: what survives a terminal's wrapping and markdown's rendering."""
+    return re.sub(r"[\W_]+", "", text)
+
+
+def recent_words(log, tail=300_000):
+    """The last things said in a Claude session, squeezed, most recent first."""
+    try:
+        with open(log, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - tail))
+            lines = f.read().decode("utf-8", "replace").split("\n")[1:]
+    except OSError:
+        return []
+    said = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+            message = entry.get("message") or {}
+        except (ValueError, AttributeError):
+            continue
+        content = message.get("content") or (entry.get("content") if entry.get("subtype") == "away_summary" else None)  # the recap shown on return
+        parts = [content] if isinstance(content, str) else [b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text"]
+        said += [squeeze(t) for t in parts if t]
+    return [t for t in reversed(said) if len(t) >= 60][:6]
+
+
+def shows(on_screen, said):
+    """Whether a screen (squeezed) carries pieces of what a session last said."""
+    pieces = [t[i:i + 40] for t in said for i in range(0, len(t) - 39, 90)][:120]  # a screen often holds only part of an answer
+    return sum(piece in on_screen for piece in pieces) >= 2
+
+
+TRIED = STATE / "tried.json"
+TRY_EVERY = 60  # seconds between two looks at a Claude pane that matches no background session
+
+
+def adopt_by_screen(session, p, st, background, taken):
+    """A pane the user renamed no longer carries its session's name: the session is then the one
+    whose last words are on the pane's screen. Looked for at most once a minute per pane."""
+    if os.path.basename(p.get("pane_command") or "").lower().split(" ")[0] != "claude":
+        return st
+    if st and st.get("agent") not in (None, "claude"):
+        return st
+    if st and st.get("session_id") in {r["sessionId"] for r in background.values()}:
+        return st  # already tied to a background session
+    key = f"{session}~{p['id']}"
+    try:
+        tried = json.loads(TRIED.read_text())
+    except (OSError, ValueError):
+        tried = {}
+    if time.time() - tried.get(key, 0) < TRY_EVERY:
+        return st
+    tried[key] = time.time()
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        TRIED.write_text(json.dumps({k: v for k, v in tried.items() if time.time() - v < 3600}))
+    except OSError:
+        pass
+    try:
+        on_screen = squeeze(screen(session, p["id"], full=True)[-40_000:])
+    except ZaagError:
+        return st
+    for record in background.values():
+        if record["sessionId"] in taken:
+            continue
+        log = claude_log(record["home"], record.get("cwd"), record["sessionId"])
+        if log and shows(on_screen, recent_words(log)):
+            return adopt(session, dict(p, title=record["name"]), st, background)
+    return st
+
+
 def adopt(session, p, st, background):
     """A pane whose title is a background Claude session's name shows that session: its state
     is tied to it without waiting for the session's next hook."""
@@ -311,8 +392,8 @@ def adopt(session, p, st, background):
         new["viewer_session_id"] = st["session_id"]
     new["status"] = "working" if record.get("status") == "busy" else "idle"
     new.setdefault("done_seq", 0)
-    log = Path(record["home"]) / "projects" / re.sub(r"[^A-Za-z0-9]", "-", new["cwd"]) / (record["sessionId"] + ".jsonl")
-    if log.exists():
+    log = claude_log(record["home"], new["cwd"], record["sessionId"])
+    if log:
         new["transcript_path"] = str(log)
     else:
         new.pop("transcript_path", None)
@@ -320,7 +401,7 @@ def adopt(session, p, st, background):
     return new
 
 
-def session_rows(session, everything, branches, background=None):
+def session_rows(session, everything, branches, background=None, taken=None):
     rows = []
     listed = panes(session)
     alive = set()
@@ -332,6 +413,7 @@ def session_rows(session, everything, branches, background=None):
         st = load(session, pane)
         if background:
             st = adopt(session, p, st, background)
+            st = adopt_by_screen(session, p, st, background, taken or set())
         if not st and not everything:
             continue
         cwd = (st or {}).get("cwd") or p.get("pane_cwd") or ""
@@ -377,11 +459,17 @@ def local_agents(everything=False, only_session=None):
         sessions = [s for s in sessions if s == only_session]
     branches = {}
     background = background_claudes()
+    taken = set()  # the sessions some pane is already tied to
+    for f in AGENTS.glob("*.json") if AGENTS.is_dir() and background else []:
+        try:
+            taken.add(json.loads(f.read_text()).get("session_id"))
+        except (OSError, ValueError):
+            pass
     rows = []
 
     def one(s):
         try:
-            return session_rows(s, everything, branches, background)
+            return session_rows(s, everything, branches, background, taken)
         except (ZaagError, ValueError):
             return []
 
@@ -859,9 +947,16 @@ def claude_pane(sid, cwd):
         if st.get("session_id") == sid and time.time() - st.get("bound", 0) < REBIND_AFTER:
             session, _, pane = f.stem.rpartition("~")
             return urllib.parse.unquote(session), pane
+    known = None  # the pane this session was last tied to, however long ago
+    for f in AGENTS.glob("*.json") if AGENTS.is_dir() else []:
+        try:
+            if json.loads(f.read_text()).get("session_id") == sid:
+                known = (urllib.parse.unquote(f.stem.rpartition("~")[0]), f.stem.rpartition("~")[2])
+        except (OSError, ValueError):
+            pass
     name = claude_session_name(sid)
     if not name:
-        return None, None
+        return known or (None, None)
 
     def titled(session):
         try:
@@ -873,9 +968,9 @@ def claude_pane(sid, cwd):
         with ThreadPoolExecutor(max_workers=8) as pool:
             found = [hit for hits in pool.map(titled, live_sessions()) for hit in hits]
     except ZaagError:
-        return None, None
+        return known or (None, None)
     if not found:
-        return None, None
+        return known or (None, None)  # a renamed pane: tied by what was on its screen
     found.sort(key=lambda hit: hit[1].get("pane_cwd") != cwd)  # the same folder first
     return found[0][0], str(found[0][1]["id"])
 

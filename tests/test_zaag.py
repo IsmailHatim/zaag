@@ -130,6 +130,12 @@ class Background(unittest.TestCase):
         codex = {"agent": "codex", "status": "idle", "session_id": "c"}
         self.assertEqual(zaag.adopt("proj", self.pane, codex, self.record), codex)
 
+    def test_a_renamed_pane_is_recognised_by_what_is_on_its_screen(self):
+        said = [zaag.squeeze("The login form now has a **remember me** checkbox, and sessions last thirty days when it is ticked. " * 3)]
+        wrapped = "  The login form now has a remember me\n  checkbox, and sessions last thirty days when\n  it is ticked. " * 3
+        self.assertTrue(zaag.shows(zaag.squeeze(wrapped), said))
+        self.assertFalse(zaag.shows(zaag.squeeze("something else entirely on this screen, nothing in common " * 5), said))
+
     def test_its_hooks_find_the_pane_by_the_session_name(self):
         with mock.patch.object(zaag, "claude_session_name", return_value="Fix login"), \
              mock.patch.object(zaag, "live_sessions", return_value=["proj"]), \
