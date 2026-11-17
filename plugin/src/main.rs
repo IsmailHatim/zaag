@@ -55,6 +55,16 @@ struct Answer {
     result: Option<Listing>,
 }
 
+#[derive(Deserialize)]
+struct Problem {
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct Refusal {
+    error: Option<Problem>,
+}
+
 #[derive(Clone, Debug)]
 enum Target {
     Session { machine: String, name: String },
@@ -109,6 +119,8 @@ struct State {
     query: String,
     selected: usize,
     renaming: Option<(Target, String)>,
+    prompting: Option<(String, Agent, String)>,
+    silent: bool,
     note: Option<String>,
     seen_sent: Option<String>,
     cols: usize,
@@ -149,6 +161,16 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
+/// The end of a text being typed, when it is longer than the room there is for it.
+fn tail(s: &str, max: usize) -> String {
+    let n = width(s);
+    if n <= max {
+        s.to_string()
+    } else {
+        std::iter::once('…').chain(s.chars().skip(n + 1 - max.max(1))).collect()
+    }
+}
+
 impl State {
     fn dot(&self, status: &str) -> Seg {
         match status {
@@ -184,6 +206,7 @@ impl State {
         }
         // a listing that never came back (ssh hanging) must not stop the next ones for ever
         if self.pending == 0 || self.pending > 8 {
+            self.silent = self.silent || self.pending > 8;
             self.pending = 1;
             self.list_seq += 1;
             let mut ctx = BTreeMap::new();
@@ -308,6 +331,10 @@ impl State {
         if !self.loaded {
             lines.push(Line { left: vec![seg(" …", DIM)], ..Default::default() });
         }
+        if self.silent {
+            // what is drawn is the last answer: it may be old
+            lines.insert(1, Line { left: vec![seg(" zaag does not answer", RED)], ..Default::default() });
+        }
         lines
     }
 
@@ -400,8 +427,33 @@ impl State {
         self.query.clear();
         self.selected = 0;
         self.renaming = None;
+        self.prompting = None;
         self.note = None;
         close_self(); // a new one each time: nothing shown can be out of date
+    }
+
+    fn start_prompt(&mut self, target: Option<&Target>) {
+        match target {
+            Some(Target::Agent { machine, agent }) => {
+                self.prompting = Some((machine.clone(), agent.clone(), String::new()));
+                self.note = None;
+            }
+            _ => self.note = Some("a prompt goes to an agent: move to one first".into()),
+        }
+    }
+
+    fn send_prompt(&mut self, machine: &str, agent: &Agent, text: &str) {
+        let to = format!("{} · {}", agent.session, agent.name);
+        let mut cmd = vec![self.zaag.as_str()];
+        if machine != "local" {
+            cmd.extend_from_slice(&["-m", machine]);
+        }
+        cmd.extend_from_slice(&["prompt", &agent.id, text]);
+        let mut ctx = BTreeMap::new();
+        ctx.insert("kind".to_string(), "prompt".to_string());
+        ctx.insert("to".to_string(), to.clone());
+        run_command(&cmd, ctx);
+        self.note = Some(format!("sending to {to}…"));
     }
 
     fn picker_key(&mut self, key: KeyWithModifier) -> bool {
@@ -429,9 +481,30 @@ impl State {
             }
             return true;
         }
+        if let Some((machine, agent, text)) = self.prompting.as_mut() {
+            match key.bare_key {
+                BareKey::Esc => self.prompting = None,
+                BareKey::Backspace => {
+                    text.pop();
+                }
+                BareKey::Char(c) if !ctrl && !alt => text.push(c),
+                BareKey::Enter if !alt => {
+                    let (machine, agent, text) = (machine.clone(), agent.clone(), text.trim().to_string());
+                    self.prompting = None;
+                    if !text.is_empty() {
+                        self.send_prompt(&machine, &agent, &text);
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
         let targets = self.picker_targets();
         match key.bare_key {
             BareKey::Esc => self.close_picker(),
+            // a prompt for the agent under the cursor, typed here and sent without going there
+            BareKey::Enter if alt => self.start_prompt(targets.get(self.selected)),
+            BareKey::Char('e') if ctrl => self.start_prompt(targets.get(self.selected)),
             BareKey::Enter => {
                 if let Some(t) = targets.get(self.selected).cloned() {
                     self.jump(&t);
@@ -556,6 +629,7 @@ impl ZellijPlugin for State {
             EventType::Visible,
             EventType::RunCommandResult,
             EventType::Key,
+            EventType::PastedText,
             EventType::Mouse,
         ]);
         // A session created with nobody attached never answers the permission request: ask again
@@ -632,6 +706,7 @@ impl ZellijPlugin for State {
                     if let Ok(Answer { result: Some(listing) }) = serde_json::from_slice::<Answer>(&stdout) {
                         self.machines = listing.machines;
                         self.loaded = true;
+                        self.silent = false;
                         // the cursor stays on the project that was just moved: only a listing asked
                         // after the move shows its new place
                         let fresh = ctx.get("seq").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0) >= self.follow_from;
@@ -643,7 +718,21 @@ impl ZellijPlugin for State {
                             }
                         }
                         self.mark_seen();
+                    } else {
+                        self.silent = true;
                     }
+                    true
+                }
+                Some("prompt") => {
+                    let to = ctx.get("to").cloned().unwrap_or_default();
+                    let refused = serde_json::from_slice::<Refusal>(&stdout).ok().and_then(|r| r.error).map(|e| e.message);
+                    self.note = Some(match refused {
+                        Some(why) => format!("{to}: {why}"),
+                        None if stdout.is_empty() => format!("{to}: not sent"),
+                        None => format!("sent to {to}"),
+                    });
+                    self.pending = 0;
+                    self.poll();
                     true
                 }
                 _ => {
@@ -654,6 +743,17 @@ impl ZellijPlugin for State {
                 }
             },
             Event::Key(key) if self.mode == Mode::Picker => self.picker_key(key),
+            Event::PastedText(pasted) if self.mode == Mode::Picker => {
+                let pasted = pasted.replace(['\n', '\r'], " ");
+                match (self.renaming.as_mut(), self.prompting.as_mut()) {
+                    (Some((_, text)), _) | (None, Some((_, _, text))) => text.push_str(&pasted),
+                    _ => {
+                        self.query.push_str(&pasted);
+                        self.select_first_agent();
+                    }
+                }
+                true
+            }
             Event::Mouse(Mouse::LeftClick(line, col)) => {
                 if self.mode == Mode::Sidebar && self.buttons_row == Some(line.max(0) as usize) {
                     if let Some(session) = self.session.clone() {
@@ -722,14 +822,20 @@ impl ZellijPlugin for State {
             return;
         }
         let count: usize = self.machines.iter().map(|m| m.agents.len()).sum();
-        let head = match &self.renaming {
-            Some((_, text)) => vec![seg(" rename: ", OLIVE), seg(format!("{text}▏"), TEXT)],
-            None if self.query.is_empty() => vec![seg(" / ", DIM), seg("search agents and projects", DIM)],
-            None => vec![seg(" / ", DIM), seg(format!("{}▏", self.query), TEXT)],
+        let head = match (&self.renaming, &self.prompting) {
+            (Some((_, text)), _) => vec![seg(" rename: ", OLIVE), seg(format!("{text}▏"), TEXT)],
+            (None, Some((_, agent, text))) => {
+                let to = format!(" prompt {} · {}: ", agent.session, clip(&agent.name, 24));
+                let room = cols.saturating_sub(width(&to) + 2);
+                vec![seg(to, OLIVE), seg(format!("{}▏", tail(text, room)), TEXT)]
+            }
+            _ if self.query.is_empty() => vec![seg(" / ", DIM), seg("search agents and projects", DIM)],
+            _ => vec![seg(" / ", DIM), seg(format!("{}▏", self.query), TEXT)],
         };
+        let right = if self.prompting.is_some() { String::new() } else { format!("{count} agents ") };
         let saved = self.scroll;
         self.scroll = 0;
-        self.draw(vec![Line { left: head, right: vec![seg(format!("{count} agents "), DIM)], ..Default::default() }, Line { left: vec![seg("─".repeat(cols), 238)], ..Default::default() }], 0, 2, cols, None);
+        self.draw(vec![Line { left: head, right: vec![seg(right, DIM)], ..Default::default() }, Line { left: vec![seg("─".repeat(cols), 238)], ..Default::default() }], 0, 2, cols, None);
         self.scroll = saved;
         let lines = self.picker_lines();
         let targets = lines.iter().filter(|l| l.target.is_some()).count();
@@ -738,7 +844,8 @@ impl ZellijPlugin for State {
         self.draw(lines, 2, body, cols, Some(self.selected));
         let hint = match &self.note {
             Some(n) => seg(format!(" {n}"), OLIVE),
-            None => seg(" enter: go   ctrl-r: rename   ctrl-u/d: move project   esc: close", DIM),
+            None if self.prompting.is_some() => seg(" enter: send   esc: cancel", DIM),
+            None => seg(" enter: go   ctrl-e: prompt   ctrl-r: rename   ctrl-u/d: move   esc: close", DIM),
         };
         let saved = self.scroll;
         self.scroll = 0;
